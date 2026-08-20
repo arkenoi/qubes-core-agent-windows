@@ -37,6 +37,12 @@
 #include <exec.h>
 #include <qubes-io.h>
 
+// How long to wait for the stdout/stderr pumps to DRAIN after the child exits, before the exit
+// code goes out and the peer closes the vchan. This is a hang backstop only - it is NOT a normal
+// completion path, and reaching it means the transfer was truncated (see EventLoop). It replaces a
+// 1000 ms wait that was routinely hit by ordinary transfers and silently shortened them.
+#define DRAIN_TIMEOUT_MS (120 * 1000)
+
 static CRITICAL_SECTION g_VchanCs;
 static BOOL g_exitCodeReceived = FALSE;
 
@@ -790,13 +796,36 @@ DWORD EventLoop(
 
             LogDebug("child process exited with code %d", exitCode);
 
-            // wait for the threads to finish before sending exit code
+            // Wait for the i/o threads to DRAIN before sending the exit code.
+            //
+            // This used to wait only 1000 ms and then send the exit code regardless, merely
+            // logging the timeout. Since the peer closes the vchan as soon as it receives the
+            // exit code (see the comment in VchanSendExitCode), anything the stdout pump had not
+            // yet written was silently DISCARDED - the response arrived short, under a normal
+            // exit code, with nothing in the protocol to say so. Measured symptom: ~1/3 of
+            // Content-Length-framed bodies short on the guest side; an 80,043-byte file returned
+            // as anything from 0 to 79,389 bytes. A 64 KB vchan buffer and a slow reader make a
+            // >1 s drain ordinary, so even small files reproduce it.
+            //
+            // The Linux implementation does not have this bug and shows the correct invariant:
+            // in libqrexec/process_io.c, SIGCHLD only records the status and closes STDIN, and
+            // send_exit_code() runs solely when stdin/stdout/stderr have all reached EOF -
+            // data-driven, with NO timeout. The exit code is the last thing on the wire, always.
+            //
+            // So: wait for both pumps with no deadline. They exit on true EOF, and the write ends
+            // are already closed here (see CreateChildPipes/StartChild), so EOF is guaranteed
+            // unless a surviving grandchild still holds one - the same exposure Linux accepts.
+            // A generous cap is kept purely as a hang backstop, and if it is ever hit that is a
+            // TRUNCATED transfer and must be logged as an error, never as a routine timeout.
             waitObjects[0] = child->StdoutThread;
             waitObjects[1] = child->StderrThread;
 
-            status = WaitForMultipleObjects(2, waitObjects, TRUE, 1000);
-            if (status == WAIT_FAILED || status == WAIT_TIMEOUT)
-                win_perror2(status, "wait for i/o threads");
+            status = WaitForMultipleObjects(2, waitObjects, TRUE, DRAIN_TIMEOUT_MS);
+            if (status == WAIT_TIMEOUT)
+                LogError("i/o threads did not finish within %lu ms: the peer will close the vchan "
+                         "on the exit code below, so this transfer is TRUNCATED", DRAIN_TIMEOUT_MS);
+            else if (status == WAIT_FAILED)
+                win_perror2(GetLastError(), "wait for i/o threads");
 
             if (!VchanSendExitCode(child, exitCode))
                 LogError("sending exit code failed");
