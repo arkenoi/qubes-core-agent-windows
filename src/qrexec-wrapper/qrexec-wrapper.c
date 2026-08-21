@@ -770,7 +770,30 @@ DWORD EventLoop(
         {
             if (!libvchan_is_open(child->Vchan))
             {
-                LogDebug("vchan closed");
+                // DRAIN BEFORE LEAVING. A closed vchan does not mean an empty one: the peer
+                // finishes sending and closes, and whatever is still sitting in the ring is data we
+                // have simply not read yet. Exiting on the close alone DISCARDS it, and because it
+                // depends on whether the close is noticed before or after the last read, it does so
+                // intermittently - measured as ~1/3 of Content-Length-framed bodies arriving short
+                // on the guest, an 80,043-byte file returned as anything from 0 to 79,389 bytes.
+                //
+                // Linux gets this right and says why. libqrexec/process_io.c leaves only when
+                //     !libvchan_is_open(vchan) && !libvchan_data_ready(vchan) && !buffer_len(...)
+                // i.e. closed AND nothing left to read AND nothing buffered - with the comment
+                // "Exit the loop if vchan is disconnected (and we processed all incoming data).
+                //  Check libvchan_is_open() before libvchan_data_ready() to avoid a race condition."
+                // That is precisely the race this port has.
+                DWORD drained = 0;
+                while (VchanGetReadBufferSize(child->Vchan) > 0)
+                {
+                    if (HandleDataMessage(child) != ERROR_SUCCESS)
+                        break;
+                    drained++;
+                }
+                if (drained > 0)
+                    LogDebug("vchan closed - drained %lu buffered message(s) before exit", drained);
+                else
+                    LogDebug("vchan closed");
                 run = FALSE;
                 break;
             }
