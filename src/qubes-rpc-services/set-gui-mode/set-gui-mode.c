@@ -41,21 +41,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstan
     if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), param, RTL_NUMBER_OF(param) - 1, &size, NULL))
         return GetLastError();
 
-    // GetLastError() IS ONLY MEANINGFUL AFTER A FAILURE. Returning it after a SUCCESSFUL
-    // SetEvent returns whatever stale code some earlier API left behind, so a mode switch that
-    // worked reports a nonzero exit status - and dom0 renders that as
-    // "Failed to set fullscreen mode: Command 'qubes.SetGuiMode' returned non-zero exit status 46"
-    // in Qubes Manager's Settings, which is what a user reported on 2026-08-28 while the switch
-    // itself was fine. Report the outcome of the call we actually made, and nothing else.
     if (_strnicmp(param, FULLSCREEN_ON_COMMAND, strlen(FULLSCREEN_ON_COMMAND)) == 0)
     {
         HANDLE event = OpenEvent(EVENT_MODIFY_STATE, FALSE, FULLSCREEN_ON_EVENT_NAME);
         if (!event)
-            return GetLastError();   // agent not running, or it never created the event
-        BOOL ok = SetEvent(event);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        CloseHandle(event);
-        return err;
+            return GetLastError();
+        SetEvent(event);
+        return GetLastError();
     }
 
     if (_strnicmp(param, FULLSCREEN_OFF_COMMAND, strlen(FULLSCREEN_OFF_COMMAND)) == 0)
@@ -63,10 +55,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previousInstan
         HANDLE event = OpenEvent(EVENT_MODIFY_STATE, FALSE, FULLSCREEN_OFF_EVENT_NAME);
         if (!event)
             return GetLastError();
-        BOOL ok = SetEvent(event);
-        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        CloseHandle(event);
-        return err;
+        SetEvent(event);
+        return GetLastError();
     }
 
     return ERROR_INVALID_PARAMETER;
