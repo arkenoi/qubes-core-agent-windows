@@ -73,7 +73,11 @@ $script:EmittedIds = @{}
 # One output line, ASCII-only and length-capped, because dom0 silently discards anything else.
 Function Emit-Entry($id, $key, $value)
 {
-    $safeId = ($id -replace '[^a-zA-Z0-9._-]', '_')
+    # Stock emits "<name>.desktop:Key=Value" and dom0's parser makes the suffix optional, so both
+    # shapes work - but the whole point of this fork is that its output is indistinguishable from
+    # stock except where we mean it. Keep the suffix.
+    $safeId = (($id -replace '[^a-zA-Z0-9._-]', '_'))
+    if ($safeId -notlike '*.desktop') { $safeId = "$safeId.desktop" }
     $safeValue = ($value -replace '[^\x20-\x7E]', '')
     if ($safeValue.Length -gt 400) { $safeValue = $safeValue.Substring(0, 400) }
     Write-Host "$($safeId):$key=$safeValue"
