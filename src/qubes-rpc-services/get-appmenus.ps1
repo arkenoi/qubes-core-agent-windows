@@ -170,10 +170,27 @@ try {
         "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 
+    # Icon for the Run Terminal entry: whatever start-app.ps1 will actually launch, so the icon
+    # matches the app rather than always showing cmd.exe's.
+    $terminalIcon = @(
+        (Get-Command 'wt.exe' -ErrorAction SilentlyContinue).Source,
+        (Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue).Source,
+        "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "$env:SystemRoot\System32\cmd.exe"
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+
     $builtins = @(
         @{ id = 'notepad';          name = 'Notepad';                            icon = "$env:SystemRoot\System32\notepad.exe";  comment = 'Text editor' }
         @{ id = 'explorer';         name = 'File Explorer';                      icon = "$env:SystemRoot\explorer.exe";          comment = 'Browse files in this qube' }
         @{ id = 'settings';         name = 'Settings';                           icon = "$env:SystemRoot\ImmersiveControlPanel\SystemSettings.exe"; comment = 'Windows settings' }
+        # THE TWO FIXED IDS. dom0's per-qube launchers are wired to specific desktop-entry
+        # names that qubes-core-agent-linux installs on every Linux qube (app-menu/Makefile:
+        # qubes-run-terminal.desktop and qubes-open-file-manager.desktop). A Windows guest
+        # emits neither, so those launchers have nothing to point at and simply do nothing -
+        # which is the whole reason "Run Terminal" and the file manager did not work here.
+        # The IDs must match EXACTLY; the names below are the upstream ones verbatim.
+        @{ id = 'qubes-run-terminal';     name = 'Run Terminal';      icon = $terminalIcon;                  comment = 'Terminal - Windows Terminal if installed, otherwise PowerShell or Command Prompt' }
+        @{ id = 'qubes-open-file-manager'; name = 'Open File Manager'; icon = "$env:SystemRoot\explorer.exe"; comment = 'Open File Explorer in this qube' }
         @{ id = 'cmd';              name = 'Command Prompt';                     icon = "$env:SystemRoot\System32\cmd.exe";      comment = 'Command Prompt' }
         @{ id = 'cmd-admin';        name = 'Command Prompt (Administrator)';     icon = "$env:SystemRoot\System32\cmd.exe";      comment = 'Command Prompt, elevated - Windows will ask for confirmation' }
         @{ id = 'powershell';       name = 'Windows PowerShell';                 icon = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"; comment = 'Windows PowerShell' }
