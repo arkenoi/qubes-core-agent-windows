@@ -19,10 +19,19 @@
  *
  #>
 
-# THIS SERVICE MUST NOT DIE SILENTLY. Owner, 2026-09-01: the dom0 app-menu entries for
-# Command Prompt and File Explorer "do not open a terminal from dom0 either ... neither it does
-# file manager". Reading this file, there were FOUR independent ways it launched nothing at all
-# and said nothing about it. All four are fixed below; each is marked WHY.
+# THE CAUSE of "Run Terminal / File Manager do nothing on a Windows qube" is NOT in this file:
+# dom0's per-qube launchers are wired to two FIXED desktop-entry ids that every Linux qube gets
+# from qubes-core-agent-linux (app-menu/Makefile) - `qubes-run-terminal` and
+# `qubes-open-file-manager` - and a Windows guest emitted neither, so they pointed at nothing.
+# Both ids are handled below and emitted by get-appmenus.ps1.
+#
+# The rest of this file was hardened at the same time. Be honest about which parts were real:
+#   MEASURED on win10-app - `Start-Process -Wait` blocked the service for the app's whole
+#     lifetime (child still running after 25 s), and `explorer.exe` with no argument gives the
+#     shell's own empty-title Progman window instead of a browser window.
+#   HARDENING, not observed here - the log.ps1 dot-source guard and the bounded logon loop.
+#     QUBES_TOOLS is set machine-wide and a session existed, so neither was the cause. Do not
+#     cite them as the fix.
 #
 # WHY 1 - the dot-source on the first line was unguarded:
 #     . $env:QUBES_TOOLS\qubes-rpc-services\log.ps1
@@ -67,6 +76,22 @@ $edge = @(
     "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 
+# The folder "Open File Manager" should show. NOT %USERPROFILE%: this service does not always
+# run as the logged-on user, and when it runs as SYSTEM that variable is
+# C:\Windows\system32\config\systemprofile - measured, the window opened titled "systemprofile".
+# Resolve the INTERACTIVE user's folder, which is what the Linux entry's `xdg-open .` means.
+function Resolve-HomeFolder {
+    try {
+        $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if ($u) {
+            $p = Join-Path "$env:SystemDrive\Users" $u.Split('\')[-1]
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+    } catch { }
+    if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE)) { return $env:USERPROFILE }
+    return "$env:SystemDrive\"
+}
+
 # "Run Terminal", mirroring the Linux agent's /usr/bin/qubes-run-terminal, which tries a list of
 # emulators and execs the first one present rather than hardcoding one. The Windows order puts
 # Windows Terminal first because it is the only one that is a real tabbed terminal; the rest are
@@ -84,13 +109,13 @@ $builtin = @{
     # WHY 4 - File Explorer. `explorer.exe` with NO argument asks the ALREADY RUNNING shell to do
     # something and the new process exits immediately; whether a window appears depends on shell
     # state. Naming a folder makes it deterministic: it always opens a browser window on it.
-    'explorer'         = @{ File = "$env:SystemRoot\explorer.exe"; Args = @($env:USERPROFILE); Elevated = $false }
+    'explorer'         = @{ File = "$env:SystemRoot\explorer.exe"; Args = @((Resolve-HomeFolder)); Elevated = $false }
     'settings'         = @{ File = 'ms-settings:';                          Elevated = $false }
     # THE TWO FIXED IDS dom0's per-qube launchers are wired to. Names come from
     # qubes-core-agent-linux/app-menu (qubes-run-terminal.desktop,
     # qubes-open-file-manager.desktop) and must match exactly - get-appmenus.ps1 emits them.
     'qubes-run-terminal'      = @{ File = (Resolve-Terminal);              Elevated = $false }
-    'qubes-open-file-manager' = @{ File = "$env:SystemRoot\explorer.exe"; Args = @($env:USERPROFILE); Elevated = $false }
+    'qubes-open-file-manager' = @{ File = "$env:SystemRoot\explorer.exe"; Args = @((Resolve-HomeFolder)); Elevated = $false }
     'cmd'              = @{ File = "$env:SystemRoot\System32\cmd.exe";      Elevated = $false }
     'cmd-admin'        = @{ File = "$env:SystemRoot\System32\cmd.exe";      Elevated = $true  }
     'powershell'       = @{ File = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"; Elevated = $false }
