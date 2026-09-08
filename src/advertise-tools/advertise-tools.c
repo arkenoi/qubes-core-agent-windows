@@ -186,117 +186,6 @@ BOOL QdbWrite(qdb_handle_t qdb, char *path, char *value)
     return qdb_write(qdb, path, value, (int)strlen(value));
 }
 
-// Wait-for-logon diagnostics: first warning after 60 s, then every 5 min. The wait itself
-// is NOT bounded on purpose - giving up would leave a slow-to-log-on guest permanently
-// unadvertised (dom0 never sees qubes-tools/qrexec=1), which is worse than waiting.
-#define LOGON_WAIT_FIRST_WARN_MS  (60 * 1000)
-#define LOGON_WAIT_REPEAT_WARN_MS (5 * 60 * 1000)
-// Used only if WTSRegisterSessionNotification is unavailable (anomaly, logged as error).
-#define LOGON_WAIT_FALLBACK_POLL_MS ((DWORD)1000)
-
-// Message-only window procedure: WM_WTSSESSION_CHANGE just wakes the wait loop below,
-// which re-runs GetCurrentUser() as the single source of truth (same as wait-for-logon.c).
-static LRESULT CALLBACK SessionWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    if (message == WM_WTSSESSION_CHANGE)
-    {
-        LogDebug("WM_WTSSESSION_CHANGE event=%lu session=%lu", (ULONG)wParam, (ULONG)lParam);
-        return 0;
-    }
-    return DefWindowProc(window, message, wParam, lParam);
-}
-
-// Blocks until an interactive session is active; *userName must be freed with WTSFreeMemory.
-// Replaces the former `while (!GetCurrentUser()) Sleep(100)`: that spin enumerated WTS
-// sessions at 10 Hz for the whole pre-logon phase and, when autologon did not fire, ran
-// forever with nothing logged after "waiting for user logon" - dom0 saw "tools not present"
-// with no guest-side trace of why. Now event-driven (WTSRegisterSessionNotification) with a
-// periodic loud diagnostic so a stuck wait is visible in the log.
-static void WaitForUserLogon(OUT char **userName)
-{
-    WNDCLASSEX wc = { 0 };
-    HWND window = NULL;
-    BOOL registered = FALSE;
-    ULONGLONG start = GetTickCount64();
-    ULONGLONG nextWarn = start + LOGON_WAIT_FIRST_WARN_MS;
-
-    if (GetCurrentUser(userName))
-        return;
-
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = SessionWndProc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = L"QubesAdvertiseToolsSessionWait";
-
-    if (!RegisterClassEx(&wc))
-    {
-        win_perror("RegisterClassEx");
-    }
-    else
-    {
-        window = CreateWindowEx(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
-        if (!window)
-            win_perror("CreateWindowEx(HWND_MESSAGE)");
-        else if (!WTSRegisterSessionNotification(window, NOTIFY_FOR_ALL_SESSIONS))
-            win_perror("WTSRegisterSessionNotification");
-        else
-            registered = TRUE;
-    }
-
-    if (!registered)
-    {
-        // Fallback is an anomaly, not a mode: session notifications exist on every supported
-        // guest (wait-for-logon.c relies on them). Say so loudly rather than absorb it.
-        LogError("session change notification unavailable - falling back to polling every %lu ms; diagnose this",
-            (ULONG)LOGON_WAIT_FALLBACK_POLL_MS);
-    }
-
-    // Re-check after registering: a logon completing between the probe above and the
-    // registration produces no notification, and would otherwise be waited on forever.
-    while (!GetCurrentUser(userName))
-    {
-        ULONGLONG now = GetTickCount64();
-        DWORD timeout;
-
-        if (now >= nextWarn)
-        {
-            LogWarning("still no active interactive session after %llu s - autologon not firing?",
-                (now - start) / 1000);
-            nextWarn = now + LOGON_WAIT_REPEAT_WARN_MS;
-        }
-        timeout = (DWORD)(nextWarn - now);
-
-        if (registered)
-        {
-            // nCount=0: wake on posted/sent messages only, or on the diagnostic deadline.
-            DWORD wait = MsgWaitForMultipleObjects(0, NULL, FALSE, timeout, QS_ALLINPUT);
-            if (wait == WAIT_OBJECT_0)
-            {
-                MSG msg;
-                while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-                {
-                    TranslateMessage(&msg);
-                    DispatchMessage(&msg);
-                }
-            }
-            else if (wait == WAIT_FAILED)
-            {
-                win_perror("MsgWaitForMultipleObjects");
-                Sleep(LOGON_WAIT_FALLBACK_POLL_MS);
-            }
-        }
-        else
-        {
-            Sleep(timeout < LOGON_WAIT_FALLBACK_POLL_MS ? timeout : LOGON_WAIT_FALLBACK_POLL_MS);
-        }
-    }
-
-    if (registered)
-        WTSUnRegisterSessionNotification(window);
-    if (window)
-        DestroyWindow(window);
-}
-
 int wmain(int argc, WCHAR *argv[])
 {
     qdb_handle_t qdb = NULL;
@@ -313,6 +202,13 @@ int wmain(int argc, WCHAR *argv[])
         return ERROR_BAD_ARGUMENTS;
     }
 
+    qdb = qdb_open(NULL);
+    if (!qdb)
+    {
+        win_perror("qdb_open");
+        goto cleanup;
+    }
+
     if (argv[1][0] == '0')
     {
         LogDebug("setting tools presence to not installed");
@@ -327,22 +223,10 @@ int wmain(int argc, WCHAR *argv[])
     // advertise tools presence
     LogDebug("waiting for user logon");
 
-    WaitForUserLogon(&userName);
+    while (!GetCurrentUser(&userName))
+        Sleep(100);
 
     LogDebug("logged on user: %S", userName);
-
-    // Open qubesdb only now, after the (unbounded) logon wait. It used to be opened before the
-    // wait: a QdbDaemon restart during a slow logon left a dead pipe handle, every QdbWrite
-    // below failed, and the guest stayed unadvertised for the boot. The parent (qrexec-agent)
-    // already waited for qubesdb before launching us, so a failure here means qubesdb WAS up
-    // and is now gone - a component loss, logged as such.
-    qdb = qdb_open(NULL);
-    if (!qdb)
-    {
-        win_perror("qdb_open");
-        LogError("qubesdb was reachable when qrexec-agent launched us and is not now; tools presence NOT advertised, dom0 will not see /qubes-tools/qrexec=1");
-        goto cleanup;
-    }
 
     /* for now mostly hardcoded values, but this can change in the future */
     if (!QdbWrite(qdb, QDB_PATH_PREFIX "version", "1"))
