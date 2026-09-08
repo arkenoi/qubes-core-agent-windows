@@ -78,10 +78,17 @@ void NtPrintf(IN const PWCHAR format, ...)
     DisplayString(buffer);
 }
 
+// Log path is kept so the result record (see WriteResultRecord) can point at it.
+static WCHAR g_LogFileName[256] = { 0 };
+
+// Fixed-name, machine-readable outcome of the last run. The per-run log has a timestamped name
+// and free-text content, so nothing could tell "the move failed" from "it never ran"; a checker
+// (installer/health-check) can read this file instead.
+#define RESULT_RECORD_PATH L"c:\\relocate-dir-result.txt"
+
 void NtLog(IN BOOLEAN print, IN const PWCHAR format, ...)
 {
     va_list args;
-    WCHAR logFileName[256];
     TIME_FIELDS tf;
     LARGE_INTEGER systemTime, localTime;
     WCHAR buffer[1024];
@@ -94,10 +101,11 @@ void NtLog(IN BOOLEAN print, IN const PWCHAR format, ...)
         NtQuerySystemTime(&systemTime);
         RtlSystemTimeToLocalTime(&systemTime, &localTime);
         RtlTimeToTimeFields(&localTime, &tf);
-        _snwprintf(logFileName, RTL_NUMBER_OF(logFileName),
+        _snwprintf(g_LogFileName, RTL_NUMBER_OF(g_LogFileName),
                    L"c:\\relocate-dir-%04d%02d%02d-%02d%02d%02d.log", // TODO: read from registry
                    tf.Year, tf.Month, tf.Day, tf.Hour, tf.Minute, tf.Second);
-        status = FileOpen(&logFile, logFileName, TRUE, TRUE, FALSE);
+        g_LogFileName[RTL_NUMBER_OF(g_LogFileName) - 1] = L'\0';
+        status = FileOpen(&logFile, g_LogFileName, TRUE, TRUE, FALSE);
         if (!NT_SUCCESS(status))
             goto print;
         FileWrite(logFile, utf16Bom, RTL_NUMBER_OF(utf16Bom), NULL);
@@ -165,7 +173,79 @@ cleanup:
     return status;
 }
 
-// TODO: preserve non-default values if present.
+// Writes RESULT_RECORD_PATH (overwritten each run). Fields are one `key=value` per line so a
+// script can grep them; the log path is included because the log name is timestamped.
+void WriteResultRecord(IN const WCHAR *result, IN const WCHAR *reason, IN NTSTATUS status,
+                       IN const WCHAR *source, IN const WCHAR *target)
+{
+    HANDLE file = NULL;
+    WCHAR buffer[1024];
+    BYTE utf16Bom[2] = { 0xFF, 0xFE };
+    NTSTATUS openStatus;
+
+    openStatus = FileOpen(&file, RESULT_RECORD_PATH, TRUE, TRUE, FALSE);
+    if (!NT_SUCCESS(openStatus))
+    {
+        NtLog(TRUE, L"[!] WriteResultRecord: FileOpen(%s) failed: %x\n", RESULT_RECORD_PATH, openStatus);
+        return;
+    }
+
+    _snwprintf(buffer, RTL_NUMBER_OF(buffer),
+               L"result=%s\r\nreason=%s\r\nstatus=0x%08x\r\nsource=%s\r\ntarget=%s\r\nlog=%s\r\n",
+               result, reason, status,
+               source ? source : L"", target ? target : L"", g_LogFileName);
+    buffer[RTL_NUMBER_OF(buffer) - 1] = L'\0';
+
+    FileWrite(file, utf16Bom, RTL_NUMBER_OF(utf16Bom), NULL);
+    FileWrite(file, buffer, (ULONG)(sizeof(WCHAR) * wcslen(buffer)), NULL);
+    NtClose(file);
+
+    NtLog(TRUE, L"[*] Result record written to %s: result=%s reason=%s\n", RESULT_RECORD_PATH, result, reason);
+}
+
+// Not declared by ntifs.h (only the Zw variant is); exported by ntdll, same signature.
+NTSTATUS
+NTAPI
+NtQueryValueKey(
+    IN  HANDLE KeyHandle,
+    IN  PUNICODE_STRING ValueName,
+    IN  KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    OUT PVOID KeyValueInformation OPTIONAL,
+    IN  ULONG Length,
+    OUT PULONG ResultLength
+    );
+
+// TRUE if a BootExecute entry is ours. The installer registers the literal
+// "relocate-dir.exe <src> <dst>" (CoreComponents.wxs); match on the image name, case-insensitive
+// (ASCII fold is enough for that literal), so no other vendor's entry can be mistaken for it.
+static BOOLEAN IsOwnBootExecuteEntry(IN const WCHAR *entry)
+{
+    static const WCHAR needle[] = L"relocate-dir";
+    const size_t needleLen = RTL_NUMBER_OF(needle) - 1;
+    size_t entryLen = wcslen(entry);
+    size_t i, j;
+
+    for (i = 0; i + needleLen <= entryLen; i++)
+    {
+        for (j = 0; j < needleLen; j++)
+        {
+            WCHAR c = entry[i + j];
+            if (c >= L'A' && c <= L'Z')
+                c = c - L'A' + L'a';
+            if (c != needle[j])
+                break;
+        }
+        if (j == needleLen)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Removes ONLY this program's entry from BootExecute. The previous version wrote the default
+// "autocheck autochk *" wholesale, so every other entry registered there (other vendors, or
+// anything Windows itself added) was dropped on EVERY exit path, success or failure. The
+// wholesale default write is now only the fallback when the current value cannot be read or is
+// not a multi-string, and it is logged as an anomaly when it happens.
 NTSTATUS RemoveBootExecuteEntry(void)
 {
     WCHAR keyName[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager";
@@ -174,6 +254,11 @@ NTSTATUS RemoveBootExecuteEntry(void)
     UNICODE_STRING keyNameU, valueNameU;
     OBJECT_ATTRIBUTES oa;
     HANDLE key = NULL;
+    KEY_VALUE_PARTIAL_INFORMATION *info = NULL;
+    WCHAR *newValue = NULL;
+    WCHAR *src, *end, *dst;
+    ULONG resultLength = 0;
+    ULONG kept = 0, removed = 0;
     NTSTATUS status;
 
     keyNameU.Buffer = keyName;
@@ -198,16 +283,97 @@ NTSTATUS RemoveBootExecuteEntry(void)
     valueNameU.Length = (USHORT)wcslen(valueName) * sizeof(WCHAR);
     valueNameU.MaximumLength = valueNameU.Length + sizeof(WCHAR);
 
-    status = NtSetValueKey(key, &valueNameU, 0, REG_MULTI_SZ, defaultValue, sizeof(defaultValue));
+    // Read the current multi-string: size query, then the data.
+    status = NtQueryValueKey(key, &valueNameU, KeyValuePartialInformation, NULL, 0, &resultLength);
+    if ((status == STATUS_BUFFER_TOO_SMALL || status == STATUS_BUFFER_OVERFLOW) && resultLength > 0)
+    {
+        // Two extra WCHARs (zeroed) guarantee termination even if the stored data lacks it.
+        info = RtlAllocateHeap(g_Heap, HEAP_ZERO_MEMORY, resultLength + 2 * sizeof(WCHAR));
+        if (!info)
+        {
+            status = STATUS_NO_MEMORY;
+        }
+        else
+        {
+            status = NtQueryValueKey(key, &valueNameU, KeyValuePartialInformation, info, resultLength, &resultLength);
+        }
+    }
+
+    if (!NT_SUCCESS(status) || !info || info->Type != REG_MULTI_SZ)
+    {
+        // Cannot see what else is registered: fall back to the old wholesale default so this
+        // program does not re-run (and re-copy) on every boot. Loud, because it drops entries.
+        NtLog(TRUE, L"[!] RemoveBootExecuteEntry: cannot read current %s (status %x, type %u); "
+                    L"writing default value, other entries (if any) are LOST\n",
+              valueName, status, info ? info->Type : 0);
+        status = NtSetValueKey(key, &valueNameU, 0, REG_MULTI_SZ, defaultValue, sizeof(defaultValue));
+        if (!NT_SUCCESS(status))
+            NtLog(TRUE, L"[!] RemoveBootExecuteEntry: NtSetValueKey(%s, %s) failed: %x\n", keyName, valueName, status);
+        goto cleanup;
+    }
+
+    // Rebuild the multi-string without our entry. Output is never longer than the input.
+    newValue = RtlAllocateHeap(g_Heap, HEAP_ZERO_MEMORY, info->DataLength + 2 * sizeof(WCHAR));
+    if (!newValue)
+    {
+        NtLog(TRUE, L"[!] RemoveBootExecuteEntry: out of memory\n");
+        status = STATUS_NO_MEMORY;
+        goto cleanup;
+    }
+
+    src = (WCHAR *)info->Data;
+    end = src + info->DataLength / sizeof(WCHAR);
+    dst = newValue;
+    while (src < end && *src)
+    {
+        size_t len = 0;
+        while (src + len < end && src[len])
+            len++;
+
+        if (IsOwnBootExecuteEntry(src))
+        {
+            NtLog(TRUE, L"[*] RemoveBootExecuteEntry: removing own entry '%s'\n", src);
+            removed++;
+        }
+        else
+        {
+            RtlCopyMemory(dst, src, len * sizeof(WCHAR));
+            dst[len] = L'\0';
+            dst += len + 1;
+            kept++;
+        }
+        src += len + 1;
+    }
+    *dst++ = L'\0'; // multi-string terminator
+
+    if (removed == 0)
+        NtLog(TRUE, L"[!] RemoveBootExecuteEntry: own entry not found in %s (nothing removed)\n", valueName);
+
+    if (kept == 0)
+    {
+        // Nothing but our entry was there, i.e. autochk had already been dropped; restore it.
+        NtLog(TRUE, L"[!] RemoveBootExecuteEntry: no other entries present, writing default value\n");
+        status = NtSetValueKey(key, &valueNameU, 0, REG_MULTI_SZ, defaultValue, sizeof(defaultValue));
+    }
+    else
+    {
+        status = NtSetValueKey(key, &valueNameU, 0, REG_MULTI_SZ, newValue, (ULONG)((dst - newValue) * sizeof(WCHAR)));
+    }
+
     if (!NT_SUCCESS(status))
     {
         NtLog(TRUE, L"[!] RemoveBootExecuteEntry: NtSetValueKey(%s, %s) failed: %x\n", keyName, valueName, status);
         goto cleanup;
     }
 
+    NtLog(TRUE, L"[*] RemoveBootExecuteEntry: %u entr%s kept, %u removed\n", kept, kept == 1 ? L"y" : L"ies", removed);
     status = STATUS_SUCCESS;
 
 cleanup:
+    if (newValue)
+        RtlFreeHeap(g_Heap, 0, newValue);
+    if (info)
+        RtlFreeHeap(g_Heap, 0, info);
     if (key)
         NtClose(key);
     return status;
@@ -219,6 +385,11 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     ULONG attrs;
     TIME_FIELDS tf;
     LARGE_INTEGER systemTime, localTime;
+    // Outcome for the result record. Every abort path used to look identical from outside
+    // (Windows boots normally, C:\Users still on the root volume, nothing reports it); the
+    // record makes "failed", "already done" and "never ran" distinguishable. Default = failed.
+    const WCHAR *result = L"failed";
+    const WCHAR *reason = L"unknown";
 
     UNREFERENCED_PARAMETER(envp);
     UNREFERENCED_PARAMETER(DebugFlag);
@@ -229,6 +400,7 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     if (!NT_SUCCESS(status))
     {
         NtLog(TRUE, L"[!] EnablePrivileges failed: %x\n", status);
+        reason = L"enable-privileges";
         goto cleanup;
     }
 
@@ -243,6 +415,7 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     {
         NtLog(TRUE, L"[!] Usage: move-profiles <source dir> <target dir>\n");
         status = STATUS_INVALID_PARAMETER;
+        reason = L"usage";
         goto cleanup;
     }
 
@@ -251,12 +424,15 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     if (!NT_SUCCESS(status))
     {
         NtLog(TRUE, L"[!] FileGetAttributes(%s) failed: %x\n", argv[1], status);
+        reason = L"source-attributes";
         goto cleanup;
     }
 
     if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
     {
         NtLog(TRUE, L"[*] Source directory (%s) is already a reparse point, aborting\n", argv[1]);
+        result = L"skipped";
+        reason = L"source-already-reparse-point";
         goto cleanup;
     }
 
@@ -264,7 +440,10 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     status = FileGetAttributes(argv[2], &attrs);
     if (NT_SUCCESS(status))
     {
+        // Source is NOT relocated (checked above) yet the target exists: typically the partial
+        // copy left by an earlier failed run. The move did not happen, so this is a failure.
         NtLog(TRUE, L"[?] Destination directory (%s) already exists, aborting\n", argv[2]);
+        reason = L"destination-exists";
         goto cleanup;
     }
 
@@ -275,6 +454,7 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     if (!NT_SUCCESS(status))
     {
         NtLog(TRUE, L"[!] FileCopyDirectory(%s, %s) failed: %x\n", argv[1], argv[2], status);
+        reason = L"copy";
         goto cleanup;
     }
 
@@ -286,6 +466,7 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
 
         // Attempt to restore previous state.
         FileCopyDirectory(argv[2], argv[1], TRUE);
+        reason = L"delete";
         goto cleanup;
     }
 
@@ -294,10 +475,13 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     if (!NT_SUCCESS(status))
     {
         NtLog(TRUE, L"[!] FileSetReparsePoint failed: %x\n", status);
+        reason = L"symlink";
         goto cleanup;
     }
 
     status = STATUS_SUCCESS;
+    result = L"ok";
+    reason = L"relocated";
 
 cleanup:
     NtQuerySystemTime(&systemTime);
@@ -306,6 +490,9 @@ cleanup:
 
     NtLog(TRUE, L"[*] End time: %04d-%02d-%02d %02d:%02d:%02d.%03d\n",
         tf.Year, tf.Month, tf.Day, tf.Hour, tf.Minute, tf.Second, tf.Milliseconds);
+
+    WriteResultRecord(result, reason, status,
+                      argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL);
 
     // Remove itself from BootExecute.
     RemoveBootExecuteEntry();
