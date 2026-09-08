@@ -91,34 +91,54 @@ struct CLIENT_CONTEXT
 #define MAX_FDS 128
 static struct _connection_info connection_info[MAX_FDS];
 
+// QdbDaemon reports RUNNING to the SCM before it has its vchan (db-daemon.c: "vchan is
+// initialized later, after the service starts and reports to the OS") and only creates its
+// client pipe after the full dom0 sync, which it is allowed 5 minutes to reach
+// (VchanInitClient(..., 5 * 60 * 1000)). The SCM dependency therefore orders process start,
+// not readiness, and QrexecAgent is launched at t~1s against a peer that may not answer until
+// t=90s or later on a slow xeniface/xenbus boot. The old 60-second cap here gave up first and
+// left the guest Running with no qrexec for the life of the boot. Cover the daemon's whole
+// connect window plus its post-connect sync.
+#define QDB_WAIT_TIMEOUT_MS ((5 * 60 + 60) * 1000)
+
 /**
  * @brief Wait for qubesdb service to start.
- * @return TRUE if a connection could be opened, FALSE if timed out (60 seconds).
+ * @param stopEvent Service stop event; the wait aborts when it is signaled.
+ * @return ERROR_SUCCESS if a connection could be opened, ERROR_CANCELLED if the service
+ *         was asked to stop while waiting, ERROR_TIMEOUT if qubesdb never answered.
  */
-BOOL WaitForQdb(void)
+static DWORD WaitForQdb(HANDLE stopEvent)
 {
     qdb_handle_t qdb = NULL;
     ULONGLONG start = GetTickCount64();
     ULONGLONG tick = start;
 
     LogDebug("start");
-    while (qdb == NULL && (tick - start) < 60 * 1000) // try for 60 seconds
+    while (qdb == NULL && (tick - start) < QDB_WAIT_TIMEOUT_MS)
     {
         qdb = qdb_open(NULL);
         if (qdb == NULL)
-            Sleep(1000);
+        {
+            // A multi-minute wait must not hold up a stop request (shutdown), so wait on the
+            // stop event instead of sleeping.
+            if (WaitForSingleObject(stopEvent, 1000) == WAIT_OBJECT_0)
+            {
+                LogDebug("stop requested while waiting for qdb");
+                return ERROR_CANCELLED;
+            }
+        }
         tick = GetTickCount64();
     }
 
     if (qdb == NULL)
     {
-        LogError("timed out: connect to qdb server");
-        return FALSE;
+        LogError("timed out after %u ms: connect to qdb server", QDB_WAIT_TIMEOUT_MS);
+        return ERROR_TIMEOUT;
     }
 
     qdb_close(qdb);
-    LogDebug("qdb is running");
-    return TRUE;
+    LogDebug("qdb is running after %I64u ms", tick - start);
+    return ERROR_SUCCESS;
 }
 
 /**
@@ -1036,6 +1056,7 @@ static DWORD HandleDaemonMessage(void)
 }
 
 static DWORD WINAPI ServiceCleanup(void);
+DWORD ProcessAutostarts(void);
 
 /**
  * @brief Vchan event loop.
@@ -1055,10 +1076,20 @@ static DWORD WatchForEvents(HANDLE stopEvent)
     LogVerbose("start");
 
     // Don't do anything before qdb is available, otherwise advertise-tools may fail.
-    if (!WaitForQdb())
+    status = WaitForQdb(stopEvent);
+    if (status == ERROR_CANCELLED)
+        return ERROR_SUCCESS; // normal stop, not a failure
+    if (status != ERROR_SUCCESS)
     {
-        return win_perror("WaitForQdb");
+        // Explicit code: GetLastError() after a failed qdb_open + wait is unspecified and can be
+        // 0, which would make this a "successful" exit the SCM's failure actions never see.
+        return win_perror2(status, "WaitForQdb");
     }
+
+    // Autostart entries were launched at service start, before this wait: they went into a
+    // guest whose qubesdb was not yet up, and a launch failure at that point was dropped for
+    // the boot. Launch them only once qubesdb is known to answer.
+    ProcessAutostarts();
 
     // We give a 5 minute timeout here because xeniface can take some time
     // to load the first time after reboot after pvdrivers installation.
@@ -1388,7 +1419,8 @@ DWORD ProcessAutostarts()
         if (status == ERROR_SUCCESS)
             CloseHandle(process);
         else
-            LogWarning("Failed to start process: %s", entry); // non-fatal
+            // Not retried this boot, so a dropped entry is a real loss, not a warning.
+            LogError("Failed to start autostart entry (dropped for this boot): %s, error %u", entry, status);
     }
 
     status = ERROR_SUCCESS;
@@ -1415,7 +1447,7 @@ DWORD WINAPI ServiceExecutionThread(void* param)
 
     libvchan_register_logger(XifLogger, LogGetLevel());
 
-    ProcessAutostarts();
+    // ProcessAutostarts() is called from WatchForEvents after qubesdb is reachable, not here.
 
     status = CreatePublicPipeSecurityDescriptor(&sd, &acl);
     if (status != ERROR_SUCCESS)
@@ -1467,9 +1499,14 @@ DWORD WINAPI ServiceExecutionThread(void* param)
     LocalFree(acl);
     LocalFree(sd);
 
-    LogInfo("Shutting down");
+    LogInfo("Shutting down, status %u", status);
 
-    return ERROR_SUCCESS;
+    // Propagate the worker's outcome. Returning ERROR_SUCCESS after a WaitForQdb timeout (or a
+    // VchanInitServer / HandleDaemonMessage failure) made the service stop with exit code 0, so
+    // the SCM failure actions armed by the installer never fired and QrexecAgent stayed Stopped
+    // for the rest of the boot. A stop request and a daemon disconnect still return 0 (unchanged).
+    // (service.c must forward this code to SetServiceStatus for the restart to actually happen.)
+    return status;
 }
 
 static DWORD WINAPI ServiceCleanup(void)
