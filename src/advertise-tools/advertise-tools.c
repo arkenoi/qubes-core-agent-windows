@@ -313,13 +313,6 @@ int wmain(int argc, WCHAR *argv[])
         return ERROR_BAD_ARGUMENTS;
     }
 
-    qdb = qdb_open(NULL);
-    if (!qdb)
-    {
-        win_perror("qdb_open");
-        goto cleanup;
-    }
-
     if (argv[1][0] == '0')
     {
         LogDebug("setting tools presence to not installed");
@@ -337,6 +330,19 @@ int wmain(int argc, WCHAR *argv[])
     WaitForUserLogon(&userName);
 
     LogDebug("logged on user: %S", userName);
+
+    // Open qubesdb only now, after the (unbounded) logon wait. It used to be opened before the
+    // wait: a QdbDaemon restart during a slow logon left a dead pipe handle, every QdbWrite
+    // below failed, and the guest stayed unadvertised for the boot. The parent (qrexec-agent)
+    // already waited for qubesdb before launching us, so a failure here means qubesdb WAS up
+    // and is now gone - a component loss, logged as such.
+    qdb = qdb_open(NULL);
+    if (!qdb)
+    {
+        win_perror("qdb_open");
+        LogError("qubesdb was reachable when qrexec-agent launched us and is not now; tools presence NOT advertised, dom0 will not see /qubes-tools/qrexec=1");
+        goto cleanup;
+    }
 
     /* for now mostly hardcoded values, but this can change in the future */
     if (!QdbWrite(qdb, QDB_PATH_PREFIX "version", "1"))

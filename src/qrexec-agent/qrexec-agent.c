@@ -1156,7 +1156,14 @@ static DWORD WatchForEvents(HANDLE stopEvent)
                 LeaveCriticalSection(&g_DaemonCriticalSection);
 
                 // advertise tools presence to dom0 by writing appropriate entries to qubesdb
-                // it waits for user logon
+                // it waits for user logon (event-driven, WTSRegisterSessionNotification).
+                // Launched HERE, on daemon connect, and not from a SERVICE_CONTROL_SESSIONCHANGE
+                // handler: the logon can precede the daemon connect (autologon vs. slow xeniface),
+                // and the SCM does not replay a logon that happened before the service accepted
+                // the control, so a handler would still need the initial-check-plus-wait the child
+                // already does - only split across the SCM thread and this loop. This launch needs
+                // only the console SESSION to exist, not a logged-on user (exec.c uses our own
+                // token, session id = console).
                 status = CreateNormalProcessAsCurrentUser(advertiseCommand, &advertiseToolsProcess);
                 if (status == ERROR_SUCCESS)
                 {
@@ -1164,8 +1171,12 @@ static DWORD WatchForEvents(HANDLE stopEvent)
                 }
                 else
                 {
-                    win_perror("Failed to create advertise-tools process");
-                    // this is non-fatal?
+                    // Not retried this boot: nothing else writes /qubes-tools/*, so dom0 never
+                    // sees qrexec=1 for this guest. Name the consequence; GetLastError() after
+                    // the helper's own cleanup is not the cause, `status` is.
+                    win_perror2(status, "Failed to create advertise-tools process");
+                    LogError("tools presence NOT advertised this boot: dom0 will not see /qubes-tools/qrexec=1 (console session id %lu)",
+                        WTSGetActiveConsoleSessionId());
                 }
                 continue;
             }
