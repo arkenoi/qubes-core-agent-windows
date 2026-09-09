@@ -365,24 +365,30 @@ BD_STATUS BdDecodeText(BD_FS *fs, const unsigned char *data, unsigned long size,
             unsigned long u = (unsigned long)data[i] | ((unsigned long)data[i + 1] << 8);
             if (u == 0)
                 goto fail;
-            if (sizeof(wchar_t) == 2)
+            // wchar_t is 16 bits on Windows and 32 on the Linux test host, so which of these two
+            // paths is correct is a COMPILE-TIME fact - and it has to be written as one. As a
+            // runtime `if (sizeof(wchar_t) == 2)` it is a constant conditional, which MSVC reports
+            // as C4127 and /WX turns into a hard error. gcc has no C4127, so the offline suite
+            // compiled it happily; the first CI build caught it. That is precisely the gap the
+            // portable-core/fake-FS split cannot cover, and why main.c and this file both have to
+            // survive a real Windows compile before either is believed.
+#if defined(BD_WCHAR_IS_16BIT) || (defined(WCHAR_MAX) && WCHAR_MAX <= 0xFFFF)
+            // 16-bit wchar_t: UTF-16 units pass straight through, surrogate pairs included -
+            // the string stays exactly the UTF-16 the file held.
+            out[n++] = (wchar_t)u;
+#else
+            // 32-bit wchar_t: combine a surrogate pair into one code point.
+            if (u >= 0xD800 && u <= 0xDBFF && i + 3 < size)
             {
-                out[n++] = (wchar_t)u;
-            }
-            else
-            {
-                // Combine surrogates for a 32-bit wchar_t host (the Linux test build).
-                if (u >= 0xD800 && u <= 0xDBFF && i + 3 < size)
+                unsigned long lo = (unsigned long)data[i + 2] | ((unsigned long)data[i + 3] << 8);
+                if (lo >= 0xDC00 && lo <= 0xDFFF)
                 {
-                    unsigned long lo = (unsigned long)data[i + 2] | ((unsigned long)data[i + 3] << 8);
-                    if (lo >= 0xDC00 && lo <= 0xDFFF)
-                    {
-                        u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
-                        i += 2;
-                    }
+                    u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 2;
                 }
-                out[n++] = (wchar_t)u;
             }
+            out[n++] = (wchar_t)u;
+#endif
         }
         out[n] = L'\0';
         *text = out;
