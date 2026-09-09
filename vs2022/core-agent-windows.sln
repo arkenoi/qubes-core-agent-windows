@@ -30,6 +30,11 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "relocate-dir", "relocate-di
 		{C5293A35-58E1-4BCB-8BC7-8D0BE9503D97} = {C5293A35-58E1-4BCB-8BC7-8D0BE9503D97}
 	EndProjectSection
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "bind-dirs", "bind-dirs\bind-dirs.vcxproj", "{7B2E5D41-9C3A-4F6E-8A1D-5E2C9B7F0A63}"
+	ProjectSection(ProjectDependencies) = postProject
+		{C5293A35-58E1-4BCB-8BC7-8D0BE9503D97} = {C5293A35-58E1-4BCB-8BC7-8D0BE9503D97}
+	EndProjectSection
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "qubes-rpc-services", "qubes-rpc-services", "{1F556433-3D35-4D84-8967-13A5D0D6D852}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "clipboard-copy", "qubes-rpc-services\clipboard-copy\clipboard-copy.vcxproj", "{DBA888E0-F486-41C5-AF4D-B4FD04330082}"
@@ -132,6 +137,10 @@ Global
 		{FA1DE025-C52D-4088-A52C-4E298B445256}.Debug|x64.Build.0 = Debug|x64
 		{FA1DE025-C52D-4088-A52C-4E298B445256}.Release|x64.ActiveCfg = Release|x64
 		{FA1DE025-C52D-4088-A52C-4E298B445256}.Release|x64.Build.0 = Release|x64
+		{7B2E5D41-9C3A-4F6E-8A1D-5E2C9B7F0A63}.Debug|x64.ActiveCfg = Debug|x64
+		{7B2E5D41-9C3A-4F6E-8A1D-5E2C9B7F0A63}.Debug|x64.Build.0 = Debug|x64
+		{7B2E5D41-9C3A-4F6E-8A1D-5E2C9B7F0A63}.Release|x64.ActiveCfg = Release|x64
+		{7B2E5D41-9C3A-4F6E-8A1D-5E2C9B7F0A63}.Release|x64.Build.0 = Release|x64
 		{DBA888E0-F486-41C5-AF4D-B4FD04330082}.Debug|x64.ActiveCfg = Debug|x64
 		{DBA888E0-F486-41C5-AF4D-B4FD04330082}.Debug|x64.Build.0 = Debug|x64
 		{DBA888E0-F486-41C5-AF4D-B4FD04330082}.Release|x64.ActiveCfg = Release|x64
