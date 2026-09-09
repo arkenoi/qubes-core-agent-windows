@@ -457,7 +457,14 @@ NTSTATUS FileCopy(IN const PWCHAR sourceName, IN const PWCHAR targetName)
         writtenTotal += writtenSize;
     }
 
-    if (writtenSize != fileSize)
+    // writtenTOTAL, not writtenSize. writtenSize is the size of the LAST chunk written by the loop
+    // above, so comparing it to the whole file size only holds for a file that fit in one 64 KiB
+    // buffer: EVERY file larger than that returned STATUS_UNSUCCESSFUL after copying perfectly.
+    // It went unnoticed because FileCopyDirectory discards its children's status - which is the
+    // more serious half, since it means a GENUINE partial copy is reported as success too.
+    // Found 2026-09-09 while building bind-dirs on this same I/O layer; MoveUsers ships in the
+    // default ADDLOCAL, so this is live code relocating C:\Users.
+    if (writtenTotal != fileSize)
         status = STATUS_UNSUCCESSFUL;
 
 cleanup:
