@@ -99,6 +99,10 @@
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);libvchan.lib;windows-utils.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <!-- Generates this project's own $(IntDir)qwt_version.h (FILEVERSION MAJOR,MINOR,PATCH,BUILD_REV) before its
+       ResourceCompile, so the exe carries the version of THIS build regardless of solution build
+       order or of a stale header left by an earlier build. See vs2022\qwt-version.props. -->
+  <Import Project="..\qwt-version.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

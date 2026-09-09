@@ -1,9 +1,11 @@
 #include <windows.h>
 #ifdef RC_INVOKED
 
-// qwt_version.h is generated during build by set_version.ps1
-// it contains definition of QWT_* macros
-#include "..\qwt_version.h"
+// qwt_version.h is generated during build by set-version.ps1 into the PROJECT's $(IntDir)
+// (vs2022\qwt-version.props puts that directory on the resource compiler's include path), so
+// every project stamps the header its own build wrote - never a shared or stale one.
+// It contains the definition of the QWT_* macros.
+#include "qwt_version.h"
 
 // QWT_FILETYPE defaults to VFT_APP
 

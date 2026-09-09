@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  qwt-version.props - generate the version header for EVERY project in this solution, per project.
+
+  WHY. Only qrexec-agent.vcxproj used to run set-version.ps1 (in its PreBuildEvent). The other
+  16 projects compile src\<x>\version.rc -> src\version_common.rc -> qwt_version.h and simply
+  ASSUMED the header was there: build any of them first and rc.exe fails with RC1015; build them
+  after a stale qrexec-agent build and they silently stamp whatever version that earlier build
+  left behind. The CI workflows worked around it by generating the header up front, which is a
+  second copy of the wiring living outside this repo - and one that MASKS this target: with the
+  header pre-generated the build stays green even if this target never runs. Every project now
+  imports this file, so each build regenerates the header from the version file + the environment
+  before its own ResourceCompile, and build ORDER can no longer decide what version an exe carries.
+  The CI up-front generation must go in the same change so a non-firing target shows as RC1015.
+
+  PER PROJECT, NOT SHARED. The header is written to $(IntDir)qwt_version.h - this project's own
+  intermediate directory - and $(IntDir) is put on the resource compiler's include path so
+  src\version_common.rc's `#include "qwt_version.h"` finds it. A single shared ..\qwt_version.h
+  written by 17 projects would race under a parallel solution build or the IDE (Windows PowerShell's
+  Move-Item -Force is a delete followed by a move, not an atomic replace, so no write strategy makes
+  a shared file safe); per-project output has nothing to race on.
+
+  WHICH GENERATOR. $(QB_SCRIPTS)\set-version.ps1 - the qubes-builderv2 contract this repo already
+  builds under (build.cmd / vs.cmd set QB_SCRIPTS). Upstream's script emits <ver>.0; the QWT-NG
+  release build copies tools/stamp-version.ps1 from the driver repo over it before building, so the
+  same call emits <ver>.<build_rev> with no change here. A caller may also point QwtSetVersionScript
+  at a generator directly (msbuild -p:QwtSetVersionScript=...). There is NO fallback when neither
+  resolves: a missing generator is a build error, never a header quietly left as-is.
+
+  FILEVERSION = MAJOR,MINOR,PATCH,BUILD_REV from ..\version (3 fields); the release build overwrites
+  that file with the gui-agent's agent/version so the whole package carries one number.
+
+  The three Error tasks below are build breaks (they stop msbuild), not gates that print a verdict.
+  Their fixtures are Windows-only: build with QB_SCRIPTS unset and no -p:QwtSetVersionScript; pass
+  -p:QwtSetVersionScript=C:\nonexistent.ps1; delete ..\version. Until a build has been seen to fail
+  on each, treat them as UNPROVEN.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <QwtVersionFile Condition="'$(QwtVersionFile)' == ''">$(MSBuildThisFileDirectory)..\version</QwtVersionFile>
+    <QwtSetVersionScript Condition="'$(QwtSetVersionScript)' == '' and '$(QB_SCRIPTS)' != ''">$(QB_SCRIPTS)\set-version.ps1</QwtSetVersionScript>
+  </PropertyGroup>
+
+  <!-- $(IntDir) is set in the project's own PropertyGroups, which precede this import, so it has
+       its final value here. Item definitions apply to every ResourceCompile item of the project
+       (all of them go through src\version_common.rc). -->
+  <ItemDefinitionGroup>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
+
+  <!-- BeforeTargets=ResourceCompile, not a PreBuildEvent: it composes with qrexec-agent's existing
+       PreBuildEvent (prebuild.ps1) instead of competing with it, and it runs right before the
+       header is consumed. Every build, unconditionally - the version depends on the environment,
+       which msbuild cannot track as an input; the generator leaves an unchanged header untouched
+       so incremental builds stay incremental. -->
+  <Target Name="QwtStampVersion" BeforeTargets="ResourceCompile">
+    <Error Condition="'$(QwtSetVersionScript)' == ''"
+           Text="QwtStampVersion: no version generator - set QB_SCRIPTS (qubes-builderv2 build_windows\scripts) or pass -p:QwtSetVersionScript=&lt;path to set-version.ps1&gt;" />
+    <Error Condition="!Exists('$(QwtSetVersionScript)')"
+           Text="QwtStampVersion: generator not found: $(QwtSetVersionScript)" />
+    <Error Condition="!Exists('$(QwtVersionFile)')"
+           Text="QwtStampVersion: version file not found: $(QwtVersionFile)" />
+    <PropertyGroup>
+      <QwtVersionHeader>$(IntDir)qwt_version.h</QwtVersionHeader>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <!-- -File so a throw in the generator is a non-zero exit and therefore a build error;
+         -ExecutionPolicy Bypass so a fresh machine fails on versions, not on policy. No post-check
+         on the header: a generator that exits 0 wrote it, and if it did not, rc.exe's RC1015 on
+         qwt_version.h is the visible failure - an Error task here could never fire. -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(QwtSetVersionScript)&quot; &quot;$(QwtVersionFile)&quot; &quot;$(QwtVersionHeader)&quot;" />
+  </Target>
+
+</Project>

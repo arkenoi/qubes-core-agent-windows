@@ -86,7 +86,7 @@
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);shlwapi.lib;pathcch.lib;libvchan.lib;qubesdb-client.lib;windows-utils.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
-      <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\qwt_version.h</Command>
+      <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO)</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -108,9 +108,13 @@
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);shlwapi.lib;pathcch.lib;libvchan.lib;qubesdb-client.lib;windows-utils.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
-      <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\qwt_version.h</Command>
+      <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO)</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
+  <!-- Generates this project's own $(IntDir)qwt_version.h (FILEVERSION MAJOR,MINOR,PATCH,BUILD_REV) before its
+       ResourceCompile, so the exe carries the version of THIS build regardless of solution build
+       order or of a stale header left by an earlier build. See vs2022\qwt-version.props. -->
+  <Import Project="..\qwt-version.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
