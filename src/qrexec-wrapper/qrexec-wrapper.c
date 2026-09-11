@@ -208,6 +208,16 @@ DWORD StartChild(
             if (ERROR_SUCCESS != status)
             {
                 win_perror2(status, "CreateNormalProcessAsUser");
+                // Run-as the requested user failed, so we degrade to SYSTEM. This is an ANOMALY on
+                // a logged-on guest, not a normal fallback: the usual cause is the GWeck field bug
+                // (2026-09-10) where dom0's default target user "user" does not match the guest's
+                // real local account (qvm-prefs default_user), so exec.c's LogonUser("user",...)
+                // failed. The correct fix for interactive services is in CreatePipedProcessAsUser
+                // (reuse the logged-on console token regardless of the requested name); log loudly
+                // here so a residual run-as failure is visible instead of silently becoming SYSTEM.
+                LogWarning("run-as user '%s' failed (0x%x) - degrading this service to SYSTEM "
+                    "(anomaly on a logged-on guest; the guest's real account may differ from the "
+                    "requested name)", userName, status);
                 status = CreateNormalProcessAsCurrentUser(
                     commandLine,
                     &child->Process);
