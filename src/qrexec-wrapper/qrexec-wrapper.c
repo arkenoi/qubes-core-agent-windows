@@ -269,6 +269,19 @@ DWORD StartChild(
         return win_perror2(status, "CreateNormalProcessAsCurrentUser");
     }
 
+    // Give the service payload the whole machine back. This process inherited qrexec-agent's
+    // one-CPU mask (QREXECPIN, qrexec-agent.c) so that its vchan and event-channel work stays on
+    // one CPU; the payload does none of that work and must not be confined to that CPU.
+    {
+        DWORD_PTR procMask = 0, sysMask = 0;
+        if (child->Process && GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) &&
+            sysMask && procMask != sysMask && !SetProcessAffinityMask(child->Process, sysMask))
+        {
+            LogWarning("QREXECPIN could not give the payload the full CPU mask 0x%Ix (error 0x%x)",
+                sysMask, GetLastError());
+        }
+    }
+
     return ERROR_SUCCESS;
 }
 
