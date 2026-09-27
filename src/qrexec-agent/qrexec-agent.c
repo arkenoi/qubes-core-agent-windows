@@ -1542,6 +1542,29 @@ int wmain(int argc, WCHAR* argv[])
 #endif
     LogVerbose("start");
 
+    // ONE CPU FOR QREXEC'S VCHAN WORK (2026-09-27). Every qrexec call spawns a qrexec-wrapper from
+    // this process, and each wrapper opens and closes a vchan and an event channel. A child inherits
+    // its parent's affinity mask, so pinning HERE keeps all of that event-channel open/close work on
+    // one CPU: no two of our qrexec processes can update the PV bus driver's channel table from
+    // different CPUs at the same moment. The stall has been caught at bursts of exactly this work
+    // (the install launch; post-install qrexec checks ~30 s after a boot). qrexec-wrapper gives the
+    // service payload it starts the full mask back, so user work is not confined to this CPU.
+    {
+        DWORD_PTR procMask = 0, sysMask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && sysMask)
+        {
+            DWORD_PTR one = sysMask & (~sysMask + 1); // the lowest CPU the system has
+            if (SetProcessAffinityMask(GetCurrentProcess(), one))
+                LogInfo("QREXECPIN qrexec pinned to CPU mask 0x%Ix (system 0x%Ix); wrappers inherit it", one, sysMask);
+            else
+                LogWarning("QREXECPIN could not pin qrexec to one CPU (error 0x%x) - running UNPINNED", GetLastError());
+        }
+        else
+        {
+            LogWarning("QREXECPIN could not read the affinity masks (error 0x%x) - running UNPINNED", GetLastError());
+        }
+    }
+
     InitializeCriticalSection(&g_DaemonCriticalSection);
     InitializeCriticalSection(&g_RequestCriticalSection);
     InitializeSRWLock(&g_ConnectionsHandlesLock);
