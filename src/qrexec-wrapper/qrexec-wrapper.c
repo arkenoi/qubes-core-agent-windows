@@ -1048,15 +1048,28 @@ cleanup:
 
     if (child)
     {
-        if (child->Vchan && libvchan_is_open(child->Vchan))
+        if (child->Vchan)
         {
-            // send "exit code" (creation status really) if the io isn't piped or child creation failed
-            if (!piped || status != ERROR_SUCCESS)
+            if (libvchan_is_open(child->Vchan))
             {
-                VchanSendHello(child->Vchan);
-                VchanSendExitCode(child, status);
+                // send "exit code" (creation status really) if the io isn't piped or child creation failed
+                if (!piped || status != ERROR_SUCCESS)
+                {
+                    VchanSendHello(child->Vchan);
+                    VchanSendExitCode(child, status);
+                }
             }
+            // ALWAYS tear the data vchan down ourselves, open or not. On the ordinary path the peer has
+            // already hung up by now (it got the exit code), libvchan_is_open() says DISCONNECTED, and
+            // this close used to be skipped - leaving the ring's grant mapping in OUR user address space
+            // and the event channel for the kernel to reclaim during process exit, from a system worker
+            // attached to the dying process. That exit-time unmap is the path the 2026-08-20 NMI dump
+            // caught spinning on a single-target TLB shootdown, and per-call qrexec churn provokes the
+            // guest stall (pre-registered A/Bs, 2026-09-28: SOAK 10/15 vs process-only churn 0/15; stock
+            // QWT the same). Releasing it here does the unmap and the close from our own thread, while we
+            // are alive. EventLoop() has already waited for the child and the I/O threads.
             libvchan_close(child->Vchan);
+            child->Vchan = NULL;
         }
         free(child);
     }
