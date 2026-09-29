@@ -606,6 +606,7 @@ DWORD HandleDataMessage(
         {
             if (!VchanSendHello(child->Vchan))
                 return ERROR_INVALID_FUNCTION;
+            child->HelloSent = TRUE;
         }
         break;
 
@@ -1050,6 +1051,8 @@ int wmain(int argc, WCHAR *argv[])
     child->Vchan = InitVchan(domain, port, child->IsVchanServer);
     if (!child->Vchan)
         goto cleanup;
+    if (child->IsVchanServer)
+        child->HelloSent = TRUE; // InitVchan sent the server's hello (it fails otherwise)
 
     if (wcscmp(userName, L"(null)") == 0)
         userName = NULL;
@@ -1150,7 +1153,10 @@ cleanup:
                 // send "exit code" (creation status really) if the io isn't piped or child creation failed
                 if (!piped || status != ERROR_SUCCESS)
                 {
-                    VchanSendHello(child->Vchan);
+                    // only if ours has not gone out yet - e.g. the child failed before the handshake; after data has
+                    // flowed (a console-control stop, an i/o error) a second hello would be a protocol error
+                    if (!child->HelloSent)
+                        VchanSendHello(child->Vchan);
                     VchanSendExitCode(child, status);
                 }
             }
