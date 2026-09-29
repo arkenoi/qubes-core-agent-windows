@@ -514,7 +514,8 @@ BOOL VchanSendHello(
 
     assert(vchan);
 
-    info.version = QREXEC_PROTOCOL_VERSION;
+    // The DATA vchan announces v3 (64 KiB chunks); see DATA_PROTOCOL_VERSION. The control vchan is not ours.
+    info.version = DATA_PROTOCOL_VERSION;
 
     return VchanSendMessage(vchan, MSG_HELLO, &info, sizeof(info), L"hello");
 }
@@ -542,7 +543,7 @@ DWORD HandleRemoteData(
     if (!buffer)
     {
         status = ERROR_NOT_ENOUGH_MEMORY;
-        buffer = malloc(MAX_DATA_CHUNK);
+        buffer = malloc(MAX_DATA_CHUNK_V3); // large enough for either negotiated version
         if (!buffer)
             goto cleanup;
     }
@@ -623,9 +624,11 @@ DWORD HandleDataMessage(
         return ERROR_INVALID_FUNCTION;
     }
 
-    if (header.len > MAX_DATA_CHUNK)
+    // The limit follows the NEGOTIATED data version: 4 KiB until (and unless) both hellos said >= 3.
+    DWORD maxChunk = (child->DataVersion >= 3) ? MAX_DATA_CHUNK_V3 : MAX_DATA_CHUNK;
+    if (header.len > maxChunk)
     {
-        LogError("msg 0x%x, size too big: %d (max %d)", header.type, header.len, MAX_DATA_CHUNK);
+        LogError("msg 0x%x, size too big: %d (max %lu, data protocol %ld)", header.type, header.len, maxChunk, child->DataVersion);
         return ERROR_INVALID_FUNCTION;
     }
 
@@ -668,6 +671,13 @@ DWORD HandleDataMessage(
             LogWarning("incompatible protocol version (got %d, expected %d)", peerInfo.version, QREXEC_PROTOCOL_VERSION);
             return ERROR_INVALID_FUNCTION;
         }
+
+        // Negotiated data version = min(ours, peer's). The peer computes the same from our hello, so from
+        // here on both sides may use chunks up to max_data_chunk(version). Set BEFORE we reply (client
+        // case): the peer only sends larger chunks after it has our hello.
+        InterlockedExchange(&child->DataVersion,
+            peerInfo.version < DATA_PROTOCOL_VERSION ? (LONG)peerInfo.version : DATA_PROTOCOL_VERSION);
+        LogInfo("data protocol version %ld (peer %d, ours %d)", child->DataVersion, peerInfo.version, DATA_PROTOCOL_VERSION);
 
         if (!child->IsVchanServer) // we're vchan client, reply with HELLO
         {
@@ -717,7 +727,7 @@ static DWORD handle_child_output(
 
     pipe = pipe_type == PTYPE_STDOUT ? &child->Stdout : &child->Stderr;
 
-    buffer = malloc(MAX_DATA_CHUNK);
+    buffer = malloc(MAX_DATA_CHUNK_V3); // large enough for either negotiated version
     if (!buffer)
     {
         LogError("no memory");
@@ -732,7 +742,10 @@ static DWORD handle_child_output(
         DWORD nread;
 
         LogVerbose("reading...");
-        BOOL ok = ReadFile(pipe->ReadEndpoint, buffer, MAX_DATA_CHUNK, &nread, NULL); // this can block
+        // Chunk per message follows the negotiated data version, re-read every pass (the hello may be
+        // processed after this thread starts): 4 KiB under v2, SEND_DATA_CHUNK_V3 under v3.
+        DWORD chunk = (child->DataVersion >= 3) ? SEND_DATA_CHUNK_V3 : MAX_DATA_CHUNK;
+        BOOL ok = ReadFile(pipe->ReadEndpoint, buffer, chunk, &nread, NULL); // this can block
         //
         // EOF is signaled by either:
         // - ok and nread == 0
@@ -1089,6 +1102,7 @@ int wmain(int argc, WCHAR *argv[])
         goto cleanup;
 
     ZeroMemory(child, sizeof(*child));
+    child->DataVersion = QREXEC_PROTOCOL_VERSION; // v2 limits until the peer's hello says otherwise
 
     InitializeCriticalSection(&g_VchanCs);
 

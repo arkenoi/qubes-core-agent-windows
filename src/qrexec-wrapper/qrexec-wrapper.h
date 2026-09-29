@@ -31,6 +31,18 @@
 #define PIPE_BUFFER_SIZE 65536
 #define PIPE_DEFAULT_TIMEOUT 100
 
+// DATA-VCHAN PROTOCOL VERSION (2026-09-29). The control vchan (qrexec-agent <-> dom0 daemon) stays at
+// QREXEC_PROTOCOL_VERSION 2: announcing 3 there obliges the agent to send MSG_TRIGGER_SERVICE3, and the
+// daemon exits on a trigger that does not match the version an agent announced. Each DATA vchan negotiates
+// its own version (min of the two hellos, independent of the control vchan), and at v3 the only change is
+// the data chunk: 64 KiB instead of 4 KiB. Under v2 a 256 MiB copy is 65,536 messages each way through the
+// wrapper; measured on this rig, a copy into a Linux qube (v3+) ran ~106 MB/s against ~47 MB/s into Windows.
+#define DATA_PROTOCOL_VERSION   3
+#define MAX_DATA_CHUNK_V3       65536
+// What this side SENDS per message once v3 is agreed: half the 64 KiB ring, so the all-or-nothing send
+// never has to wait for a completely empty ring (the peer accepts anything up to MAX_DATA_CHUNK_V3).
+#define SEND_DATA_CHUNK_V3      32768
+
 typedef enum _PIPE_TYPE
 {
     PTYPE_INVALID = 0,
@@ -63,6 +75,10 @@ typedef struct _CHILD_STATE
     libvchan_t   *Vchan;
 
     BOOL         IsVchanServer;
+
+    // Negotiated DATA-vchan protocol version: 2 until the peer's hello is processed, then min(ours, peer's).
+    // Read by the stdout/stderr threads while the main thread may set it, hence volatile LONG + Interlocked.
+    volatile LONG DataVersion;
 
     // Our MSG_HELLO has gone out on the data vchan (the server sends it in InitVchan, the client replies to the peer's).
     // The final cleanup sends one only if not: a second hello on a vchan that already carried data is a protocol error.
