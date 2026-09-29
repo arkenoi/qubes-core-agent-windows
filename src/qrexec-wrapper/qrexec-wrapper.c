@@ -742,10 +742,9 @@ static DWORD handle_child_output(
         DWORD nread;
 
         LogVerbose("reading...");
-        // Chunk per message follows the negotiated data version, re-read every pass (the hello may be
-        // processed after this thread starts): 4 KiB under v2, SEND_DATA_CHUNK_V3 under v3.
-        DWORD chunk = (child->DataVersion >= 3) ? SEND_DATA_CHUNK_V3 : MAX_DATA_CHUNK;
-        BOOL ok = ReadFile(pipe->ReadEndpoint, buffer, chunk, &nread, NULL); // this can block
+        // Sends stay at 4 KiB under either version (see MAX_DATA_CHUNK_V3 in qrexec-wrapper.h: larger sends
+        // made copy-out slower through the all-or-nothing, Sleep(1)-polling send path).
+        BOOL ok = ReadFile(pipe->ReadEndpoint, buffer, MAX_DATA_CHUNK, &nread, NULL); // this can block
         //
         // EOF is signaled by either:
         // - ok and nread == 0

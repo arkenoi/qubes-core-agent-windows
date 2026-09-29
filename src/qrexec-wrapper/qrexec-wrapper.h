@@ -39,9 +39,10 @@
 // wrapper; measured on this rig, a copy into a Linux qube (v3+) ran ~106 MB/s against ~47 MB/s into Windows.
 #define DATA_PROTOCOL_VERSION   3
 #define MAX_DATA_CHUNK_V3       65536
-// What this side SENDS per message once v3 is agreed: half the 64 KiB ring, so the all-or-nothing send
-// never has to wait for a completely empty ring (the peer accepts anything up to MAX_DATA_CHUNK_V3).
-#define SEND_DATA_CHUNK_V3      32768
+// What this side SENDS stays at MAX_DATA_CHUNK (4 KiB) under either version - v3 only raises the MAXIMUM a
+// chunk may be. Measured 2026-09-29 (interleaved, 3 rounds, Windows 11): with 32 KiB sends, copy OUT of the guest
+// fell (median 51 -> 28 MB/s), because each send is all-or-nothing and waits for a ring gap the size of the WHOLE
+// chunk by polling with Sleep(1). Receiving up to 64 KiB is where the gain is (copy IN median 55 -> 94 MB/s).
 
 typedef enum _PIPE_TYPE
 {
