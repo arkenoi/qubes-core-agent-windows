@@ -52,7 +52,9 @@ CRITICAL_SECTION g_RequestCriticalSection;
 SRWLOCK g_ConnectionsHandlesLock;
 
 LIST_ENTRY g_RequestList; // pending service requests (local)
-ULONG g_RequestId = 0;
+// Pipe threads run concurrently (one per qrexec-client-vm connection): ids come from InterlockedIncrement, so two
+// simultaneous requests can never share one (replies are matched by id).
+volatile LONG g_RequestId = 0;
 
 #ifdef _DEBUG
 void DumpRequestList(void)
@@ -771,6 +773,11 @@ static PSERVICE_REQUEST FindServiceRequest(
         PSERVICE_REQUEST context = (PSERVICE_REQUEST)CONTAINING_RECORD(entry, SERVICE_REQUEST, ListEntry);
         if (0 == strcmp(context->RequestId.ident, requestId))
         {
+            // TAKE it: unlinked under the lock, so from here the caller owns it exclusively - no other thread can
+            // find or free it (the pipe thread frees its own request only if it is still queued, see
+            // UnqueueServiceRequest).
+            RemoveEntryList(&context->ListEntry);
+            InitializeListHead(&context->ListEntry);
             returnContext = context;
             break;
         }
@@ -802,7 +809,7 @@ DWORD HandleServiceConnect(IN const struct msg_header* header)
     struct exec_params* params = NULL;
     PSERVICE_REQUEST context = NULL;
 
-    LogVerbose("msg 0x%x, len %d", header->type, header->len);
+    LogVerbose("msg 0x%x, len %u", header->type, header->len);
 
     params = ReceiveExecParams(header->len);
     if (!params)
@@ -825,10 +832,7 @@ DWORD HandleServiceConnect(IN const struct msg_header* header)
     status = StartChild(params->connect_domain, params->connect_port, context->UserName, context->CommandLine, TRUE, TRUE, TRUE);
     if (ERROR_SUCCESS != status)
         win_perror("StartChild");
-
-    EnterCriticalSection(&g_RequestCriticalSection);
-    RemoveEntryList(&context->ListEntry);
-    LeaveCriticalSection(&g_RequestCriticalSection);
+    // (FindServiceRequest already unlinked it: this thread owns it and frees it below)
 
 cleanup:
     if (context)
@@ -852,10 +856,18 @@ DWORD HandleServiceRefused(IN const struct msg_header* header)
     struct service_params serviceParams;
     PSERVICE_REQUEST context;
 
-    LogDebug("msg 0x%x, len %d", header->type, header->len);
+    LogDebug("msg 0x%x, len %u", header->type, header->len);
 
+    // Exactly one struct service_params: reading header->len bytes into this 32-byte stack struct unchecked would
+    // overflow it on any longer message.
+    if (header->len != sizeof(serviceParams))
+    {
+        LogError("MSG_SERVICE_REFUSED with length %u, expected %Iu", header->len, sizeof(serviceParams));
+        return ERROR_INVALID_FUNCTION;
+    }
     if (!VchanReceiveBuffer(g_DaemonVchan, &serviceParams, header->len, L"service_params"))
         return ERROR_INVALID_FUNCTION;
+    serviceParams.ident[sizeof(serviceParams.ident) - 1] = 0;
 
     LogDebug("request id '%S'", serviceParams.ident);
 
@@ -866,14 +878,11 @@ DWORD HandleServiceRefused(IN const struct msg_header* header)
         return ERROR_INVALID_PARAMETER;
     }
 
-    LogInfo("Qrexec service refused by daemon: domain '%S', service '%S', user '%s, local command '%s'",
+    LogInfo("Qrexec service refused by daemon: domain '%S', service '%S', user '%s', local command '%s'",
         context->TargetDomain, context->ServiceName, context->UserName, context->CommandLine);
 
     // TODO: notify user?
-
-    EnterCriticalSection(&g_RequestCriticalSection);
-    RemoveEntryList(&context->ListEntry);
-    LeaveCriticalSection(&g_RequestCriticalSection);
+    // (FindServiceRequest already unlinked it: this thread owns it and frees it below)
 
     free(context->ServiceName);
     free(context->UserName);
@@ -964,7 +973,7 @@ static DWORD HandleExec(IN const struct msg_header* header, BOOL piped)
     BOOL interactive;
     struct exec_params* exec;
 
-    LogVerbose("msg 0x%x, len %d", header->type, header->len);
+    LogVerbose("msg 0x%x, len %u", header->type, header->len);
 
     exec = HandleExecCommon(header->len, &userName, &commandLine, &interactive);
     if (!exec)
@@ -1251,6 +1260,28 @@ static void XifLogger(int level, const char* function, const WCHAR* format, va_l
 }
 
 /**
+ * @brief Unlink a request the pipe thread queued, if it is still queued.
+ * @return TRUE if this call unlinked it (the caller now owns and frees it); FALSE if the main thread already took it
+ *         (then the main thread owns it and the caller must not touch it).
+ */
+static BOOL UnqueueServiceRequest(PSERVICE_REQUEST request)
+{
+    BOOL found = FALSE;
+    EnterCriticalSection(&g_RequestCriticalSection);
+    for (PLIST_ENTRY entry = g_RequestList.Flink; entry != &g_RequestList; entry = entry->Flink)
+    {
+        if (entry == &request->ListEntry)
+        {
+            RemoveEntryList(entry);
+            found = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_RequestCriticalSection);
+    return found;
+}
+
+/**
  * @brief Thread servicing a single qrexec-client-vm
  * @param param CLIENT_CONTEXT*.
  */
@@ -1335,10 +1366,18 @@ DWORD WINAPI PipeClientThread(PVOID param)
         win_perror2(status, "QpsRead(user size)");
         goto cleanup;
     }
+    // a non-empty WCHAR string that fits the path limits we use: at least the terminator, whole WCHARs, bounded
+    if (stringSize < sizeof(WCHAR) || stringSize % sizeof(WCHAR) != 0 || stringSize > 32768 * sizeof(WCHAR))
+    {
+        LogError("user size %Iu out of range - request refused", stringSize);
+        status = ERROR_INVALID_DATA;
+        goto cleanup;
+    }
 
     context->UserName = malloc(stringSize);
     if (!context->UserName)
     {
+        status = ERROR_OUTOFMEMORY; // status still held the previous read's ERROR_SUCCESS: cleanup would not free
         goto cleanup;
     }
 
@@ -1348,6 +1387,7 @@ DWORD WINAPI PipeClientThread(PVOID param)
         win_perror2(status, "QpsRead(user)");
         goto cleanup;
     }
+    context->UserName[stringSize / sizeof(WCHAR) - 1] = L'\0'; // guarantee the terminator before any use
 
     // command line size, including null terminator
     status = QpsRead(ctx->server, ctx->id, &stringSize, sizeof(stringSize));
@@ -1356,10 +1396,18 @@ DWORD WINAPI PipeClientThread(PVOID param)
         win_perror2(status, "QpsRead(cmd size)");
         goto cleanup;
     }
+    // a non-empty WCHAR string that fits the path limits we use: at least the terminator, whole WCHARs, bounded
+    if (stringSize < sizeof(WCHAR) || stringSize % sizeof(WCHAR) != 0 || stringSize > 32768 * sizeof(WCHAR))
+    {
+        LogError("cmd size %Iu out of range - request refused", stringSize);
+        status = ERROR_INVALID_DATA;
+        goto cleanup;
+    }
 
     context->CommandLine = malloc(stringSize);
     if (!context->CommandLine)
     {
+        status = ERROR_OUTOFMEMORY; // as above
         goto cleanup;
     }
 
@@ -1369,14 +1417,16 @@ DWORD WINAPI PipeClientThread(PVOID param)
         win_perror2(status, "QpsRead(cmd)");
         goto cleanup;
     }
+    context->CommandLine[stringSize / sizeof(WCHAR) - 1] = L'\0'; // guarantee the terminator before any use
 
-    LogInfo("Received request from client %lu: domain '%S', service '%S', user '%s', local command '%s', request id %lu",
+    ULONG requestId = (ULONG)InterlockedIncrement(&g_RequestId); // unique across concurrent pipe threads
+    StringCbPrintfA(context->RequestId.ident, sizeof(context->RequestId.ident), "%lu", requestId);
+    LogInfo("Received request from client %lld: domain '%S', service '%S', user '%s', local command '%s', request id %lu",
         ctx->id, context->TargetDomain, context->ServiceName,
-        context->UserName, context->CommandLine, g_RequestId);
+        context->UserName, context->CommandLine, requestId);
 
     QpsDisconnectClient(ctx->server, ctx->id);
 
-    StringCbPrintfA(context->RequestId.ident, sizeof(context->RequestId.ident), "%lu", g_RequestId++);
 
     // MSG_TRIGGER_SERVICE4: fixed part + NUL-terminated service name. The source domain stays EMPTY, exactly as
     // upstream's qrexec-client-vm sends it unless a source qube is given.
@@ -1393,19 +1443,26 @@ DWORD WINAPI PipeClientThread(PVOID param)
     fixed->target_domain[sizeof(fixed->target_domain) - 1] = 0;
     fixed->request_id = context->RequestId;
     CopyMemory(trigger + sizeof(*fixed), context->ServiceName, nameSize);
+    // Queue the request BEFORE the trigger goes out: the daemon's MSG_SERVICE_CONNECT/REFUSED is matched on the main
+    // thread, and a reply that arrives before the insert found nothing pending ("request not pending") and failed a
+    // legitimate call. If the send fails, take it back out before cleanup frees it.
+    EnterCriticalSection(&g_RequestCriticalSection);
+    InsertTailList(&g_RequestList, &context->ListEntry);
+    LeaveCriticalSection(&g_RequestCriticalSection);
+
     BOOL sent = VchanSendMessage(g_DaemonVchan, MSG_TRIGGER_SERVICE4_ID, trigger, (ULONG)triggerSize, L"trigger_service_params4");
     free(trigger);
     if (!sent)
     {
         LogError("sending trigger params to daemon failed");
         status = ERROR_INVALID_FUNCTION;
+        if (!UnqueueServiceRequest(context))
+        {
+            // the main thread already took it (a reply to a partly sent trigger): it owns and frees it now
+            context = NULL;
+        }
         goto cleanup;
     }
-
-    // add to pending requests
-    EnterCriticalSection(&g_RequestCriticalSection);
-    InsertTailList(&g_RequestList, &context->ListEntry);
-    LeaveCriticalSection(&g_RequestCriticalSection);
 
     status = ERROR_SUCCESS;
     // context and user/command line will be freed in HandleService*
