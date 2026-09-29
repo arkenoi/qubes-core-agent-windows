@@ -514,7 +514,7 @@ BOOL VchanSendHello(
 
     assert(vchan);
 
-    // The DATA vchan announces v3 (64 KiB chunks); see DATA_PROTOCOL_VERSION. The control vchan is not ours.
+    // The DATA vchan announces DATA_PROTOCOL_VERSION (4, as upstream; on the data vchan that means v3's 64 KiB chunks).
     info.version = DATA_PROTOCOL_VERSION;
 
     return VchanSendMessage(vchan, MSG_HELLO, &info, sizeof(info), L"hello");
