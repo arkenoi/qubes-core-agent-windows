@@ -21,7 +21,8 @@
 
 // This program is used to trigger qrexec services in remote domains.
 // It connects to local qrexec agent and sends it:
-// trigger_service_params (service params), size_t (local handler path size), local handler path (WCHARs).
+// the protocol v4 request described in qrexec-agent/qrexec-v4.h: magic, target domain, full service name
+// (variable length), then user name and local handler command line (WCHARs), each size-prefixed.
 // Local handler will be launched as the local endpoint for the triggered service.
 
 #include <windows.h>
@@ -33,6 +34,7 @@
 #include <utf8-conv.h>
 #include <pipe-server.h>
 #include <exec.h>
+#include "../qrexec-agent/qrexec-v4.h"
 
 int wmain(int argc, WCHAR *argv[])
 {
@@ -40,7 +42,10 @@ int wmain(int argc, WCHAR *argv[])
 
     HANDLE readPipe, writePipe;
     PWSTR pipeName = L"\\\\.\\pipe\\qrexec_trigger"; // FIXME hardcoded path
-    struct trigger_service_params triggerParams = { 0 };
+    char targetDomain[64] = { 0 };
+    char *serviceNameUtf8 = NULL;
+    size_t serviceNameSize = 0;
+    UINT32 magic = QREXEC_CLIENT_PIPE_MAGIC_V4;
     ULONG status;
     char* argumentUtf8;
     HRESULT hresult;
@@ -68,9 +73,18 @@ int wmain(int argc, WCHAR *argv[])
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "ConvertUTF16ToUTF8Static(serviceName)");
 
-    hresult = StringCchCopyA(triggerParams.service_name, sizeof(triggerParams.service_name), argumentUtf8);
-    if (FAILED(hresult))
-        return win_perror2(hresult, "StringCchCopyA");
+    // v4: the full service name (with its +argument), up to upstream's limit - no longer cut to 63 characters.
+    // Copied out at once: the conversion buffer is static and the next conversion reuses it.
+    serviceNameSize = strlen(argumentUtf8) + 1;
+    if (serviceNameSize > MAX_SERVICE_NAME_LEN_V4)
+    {
+        LogError("service name is %Iu bytes, the protocol limit is %u", serviceNameSize, MAX_SERVICE_NAME_LEN_V4);
+        return ERROR_INVALID_PARAMETER;
+    }
+    serviceNameUtf8 = malloc(serviceNameSize);
+    if (!serviceNameUtf8)
+        return ERROR_OUTOFMEMORY;
+    CopyMemory(serviceNameUtf8, argumentUtf8, serviceNameSize);
 
     argumentUtf8 = NULL;
 
@@ -78,9 +92,9 @@ int wmain(int argc, WCHAR *argv[])
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "ConvertUTF16ToUTF8Static(domainName)");
 
-    hresult = StringCchCopyA(triggerParams.target_domain, sizeof(triggerParams.target_domain), argumentUtf8);
+    hresult = StringCchCopyA(targetDomain, sizeof(targetDomain), argumentUtf8);
     if (FAILED(hresult))
-        return win_perror2(hresult, "StringCchCopyA");
+        return win_perror2(hresult, "StringCchCopyA(target domain)");
 
     argumentUtf8 = NULL;
 
@@ -92,8 +106,18 @@ int wmain(int argc, WCHAR *argv[])
     CloseHandle(readPipe);
     LogDebug("Sending the parameters to qrexec-agent");
 
-    if (!QioWriteBuffer(writePipe, &triggerParams, sizeof(triggerParams)))
-        return win_perror("write trigger params to agent");
+    if (!QioWriteBuffer(writePipe, &magic, sizeof(magic)))
+        return win_perror("write request magic to agent");
+
+    if (!QioWriteBuffer(writePipe, targetDomain, sizeof(targetDomain)))
+        return win_perror("write target domain to agent");
+
+    if (!QioWriteBuffer(writePipe, &serviceNameSize, sizeof(serviceNameSize)))
+        return win_perror("write service name size to agent");
+
+    if (!QioWriteBuffer(writePipe, serviceNameUtf8, (DWORD)serviceNameSize))
+        return win_perror("write service name to agent");
+    free(serviceNameUtf8);
 
     size = (wcslen(userName) + 1) * sizeof(WCHAR);
     if (!QioWriteBuffer(writePipe, &size, sizeof(size)))

@@ -37,7 +37,7 @@
 // its own version (min of the two hellos, independent of the control vchan), and at v3 the only change is
 // the data chunk: 64 KiB instead of 4 KiB. Under v2 a 256 MiB copy is 65,536 messages each way through the
 // wrapper; measured on this rig, a copy into a Linux qube (v3+) ran ~106 MB/s against ~47 MB/s into Windows.
-#define DATA_PROTOCOL_VERSION   3
+#define DATA_PROTOCOL_VERSION   4   // v4 on the data vchan is v3 there (64 KiB chunks); 4 for consistency with upstream
 #define MAX_DATA_CHUNK_V3       65536
 // What this side SENDS stays at MAX_DATA_CHUNK (4 KiB) under either version - v3 only raises the MAXIMUM a
 // chunk may be. Measured 2026-09-29 (interleaved, 3 rounds, Windows 11): with 32 KiB sends, copy OUT of the guest

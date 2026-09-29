@@ -23,6 +23,7 @@
 #include <windows.h>
 
 #include <qrexec.h>
+#include "qrexec-v4.h"
 
 #define SERVICE_NAME                    L"QrexecAgent"
 #define DEFAULT_USER_PASSWORD_UNICODE   L"userpass"
@@ -46,7 +47,9 @@
 typedef struct _SERVICE_REQUEST
 {
     LIST_ENTRY ListEntry;
-    struct trigger_service_params ServiceParams;
+    struct service_params RequestId; // assigned here, echoed back by the daemon in MSG_SERVICE_CONNECT/REFUSED
+    char TargetDomain[64];           // NUL-terminated
+    char *ServiceName;               // NUL-terminated UTF-8, variable length (protocol v4)
     PWSTR UserName; // user name for the service handler
     PWSTR CommandLine; // executable that will be the local service endpoint
 } SERVICE_REQUEST, *PSERVICE_REQUEST;

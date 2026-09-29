@@ -66,8 +66,8 @@ void DumpRequestList(void)
     {
         PSERVICE_REQUEST context = (PSERVICE_REQUEST)CONTAINING_RECORD(entry, SERVICE_REQUEST, ListEntry);
         LogDebug("request %S, service %S, domain %S, user %s, cmd %s",
-            context->ServiceParams.request_id, context->ServiceParams.service_name,
-            context->ServiceParams.target_domain, context->UserName, context->CommandLine);
+            context->RequestId.ident, context->ServiceName,
+            context->TargetDomain, context->UserName, context->CommandLine);
         entry = entry->Flink;
     }
     LeaveCriticalSection(&g_RequestCriticalSection);
@@ -691,7 +691,8 @@ BOOL VchanSendHello(
 
     assert(vchan);
 
-    info.version = QREXEC_PROTOCOL_VERSION;
+    // Control vchan: announce v4, as upstream's agent does; guest-initiated calls then go out as MSG_TRIGGER_SERVICE4.
+    info.version = QREXEC_PROTOCOL_V4;
 
     return VchanSendMessage(vchan, MSG_HELLO, &info, sizeof(info), L"hello");
 }
@@ -768,7 +769,7 @@ static PSERVICE_REQUEST FindServiceRequest(
     while (entry != &g_RequestList)
     {
         PSERVICE_REQUEST context = (PSERVICE_REQUEST)CONTAINING_RECORD(entry, SERVICE_REQUEST, ListEntry);
-        if (0 == strcmp(context->ServiceParams.request_id.ident, requestId))
+        if (0 == strcmp(context->RequestId.ident, requestId))
         {
             returnContext = context;
             break;
@@ -781,7 +782,7 @@ static PSERVICE_REQUEST FindServiceRequest(
     if (returnContext)
     {
         LogDebug("found request: domain '%S', service '%S', user '%s', command '%s'",
-            returnContext->ServiceParams.target_domain, returnContext->ServiceParams.service_name,
+            returnContext->TargetDomain, returnContext->ServiceName,
             returnContext->UserName, returnContext->CommandLine);
     }
     else
@@ -832,6 +833,7 @@ DWORD HandleServiceConnect(IN const struct msg_header* header)
 cleanup:
     if (context)
     {
+        free(context->ServiceName);
         free(context->UserName);
         free(context->CommandLine);
     }
@@ -865,7 +867,7 @@ DWORD HandleServiceRefused(IN const struct msg_header* header)
     }
 
     LogInfo("Qrexec service refused by daemon: domain '%S', service '%S', user '%s, local command '%s'",
-        context->ServiceParams.target_domain, context->ServiceParams.service_name, context->UserName, context->CommandLine);
+        context->TargetDomain, context->ServiceName, context->UserName, context->CommandLine);
 
     // TODO: notify user?
 
@@ -873,6 +875,7 @@ DWORD HandleServiceRefused(IN const struct msg_header* header)
     RemoveEntryList(&context->ListEntry);
     LeaveCriticalSection(&g_RequestCriticalSection);
 
+    free(context->ServiceName);
     free(context->UserName);
     free(context->CommandLine);
     free(context);
@@ -1264,11 +1267,64 @@ DWORD WINAPI PipeClientThread(PVOID param)
 
     context->CommandLine = NULL;
     context->UserName = NULL;
+    context->ServiceName = NULL;
+    ZeroMemory(&context->RequestId, sizeof(context->RequestId));
+    ZeroMemory(context->TargetDomain, sizeof(context->TargetDomain));
 
-    status = QpsRead(ctx->server, ctx->id, &context->ServiceParams, sizeof(context->ServiceParams));
+    // v4 request from qrexec-client-vm (see qrexec-v4.h): magic, target, service name (variable length), then as before
+    UINT32 magic = 0;
+    status = QpsRead(ctx->server, ctx->id, &magic, sizeof(magic));
     if (ERROR_SUCCESS != status)
     {
-        win_perror2(status, "QpsRead(params)");
+        win_perror2(status, "QpsRead(magic)");
+        goto cleanup;
+    }
+    if (magic != QREXEC_CLIENT_PIPE_MAGIC_V4)
+    {
+        LogError("qrexec-client-vm sent pipe format 0x%x, expected 0x%x (v4) - is it from the same package? request refused",
+                 magic, QREXEC_CLIENT_PIPE_MAGIC_V4);
+        status = ERROR_INVALID_DATA;
+        goto cleanup;
+    }
+
+    status = QpsRead(ctx->server, ctx->id, context->TargetDomain, sizeof(context->TargetDomain));
+    if (ERROR_SUCCESS != status)
+    {
+        win_perror2(status, "QpsRead(target)");
+        goto cleanup;
+    }
+    context->TargetDomain[sizeof(context->TargetDomain) - 1] = 0;
+
+    // service name size, including the NUL terminator
+    status = QpsRead(ctx->server, ctx->id, &stringSize, sizeof(stringSize));
+    if (ERROR_SUCCESS != status)
+    {
+        win_perror2(status, "QpsRead(service size)");
+        goto cleanup;
+    }
+    if (stringSize < 2 || stringSize > MAX_SERVICE_NAME_LEN_V4)
+    {
+        LogError("service name size %Iu out of range (2..%u) - request refused", stringSize, MAX_SERVICE_NAME_LEN_V4);
+        status = ERROR_INVALID_DATA;
+        goto cleanup;
+    }
+    context->ServiceName = malloc(stringSize);
+    if (!context->ServiceName)
+    {
+        status = ERROR_OUTOFMEMORY;
+        goto cleanup;
+    }
+    status = QpsRead(ctx->server, ctx->id, context->ServiceName, (DWORD)stringSize);
+    if (ERROR_SUCCESS != status)
+    {
+        win_perror2(status, "QpsRead(service)");
+        goto cleanup;
+    }
+    // exactly one NUL, at the end: the daemon refuses anything else (and must never see a malformed trigger)
+    if (context->ServiceName[stringSize - 1] != 0 || strlen(context->ServiceName) != stringSize - 1)
+    {
+        LogError("service name is not a single NUL-terminated string - request refused");
+        status = ERROR_INVALID_DATA;
         goto cleanup;
     }
 
@@ -1315,13 +1371,31 @@ DWORD WINAPI PipeClientThread(PVOID param)
     }
 
     LogInfo("Received request from client %lu: domain '%S', service '%S', user '%s', local command '%s', request id %lu",
-        ctx->id, context->ServiceParams.target_domain, context->ServiceParams.service_name,
+        ctx->id, context->TargetDomain, context->ServiceName,
         context->UserName, context->CommandLine, g_RequestId);
 
     QpsDisconnectClient(ctx->server, ctx->id);
 
-    StringCbPrintfA(context->ServiceParams.request_id.ident, sizeof(context->ServiceParams.request_id.ident), "%lu", g_RequestId++);
-    if (!VchanSendMessage(g_DaemonVchan, MSG_TRIGGER_SERVICE, &context->ServiceParams, sizeof(context->ServiceParams), L"trigger_service_params"))
+    StringCbPrintfA(context->RequestId.ident, sizeof(context->RequestId.ident), "%lu", g_RequestId++);
+
+    // MSG_TRIGGER_SERVICE4: fixed part + NUL-terminated service name. The source domain stays EMPTY, exactly as
+    // upstream's qrexec-client-vm sends it unless a source qube is given.
+    size_t nameSize = strlen(context->ServiceName) + 1;
+    size_t triggerSize = sizeof(struct trigger_service_params4_fixed) + nameSize;
+    PBYTE trigger = calloc(1, triggerSize);
+    if (!trigger)
+    {
+        status = ERROR_OUTOFMEMORY;
+        goto cleanup;
+    }
+    struct trigger_service_params4_fixed *fixed = (struct trigger_service_params4_fixed *)trigger;
+    CopyMemory(fixed->target_domain, context->TargetDomain, sizeof(fixed->target_domain));
+    fixed->target_domain[sizeof(fixed->target_domain) - 1] = 0;
+    fixed->request_id = context->RequestId;
+    CopyMemory(trigger + sizeof(*fixed), context->ServiceName, nameSize);
+    BOOL sent = VchanSendMessage(g_DaemonVchan, MSG_TRIGGER_SERVICE4_ID, trigger, (ULONG)triggerSize, L"trigger_service_params4");
+    free(trigger);
+    if (!sent)
     {
         LogError("sending trigger params to daemon failed");
         status = ERROR_INVALID_FUNCTION;
@@ -1341,6 +1415,7 @@ cleanup:
     {
         if (context)
         {
+            free(context->ServiceName);
             free(context->UserName);
             free(context->CommandLine);
         }
