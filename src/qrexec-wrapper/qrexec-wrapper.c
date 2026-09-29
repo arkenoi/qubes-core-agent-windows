@@ -55,6 +55,12 @@ static CRITICAL_SECTION g_VchanCs;
 static HANDLE g_StopEvent = NULL;
 static HANDLE g_ClosedEvent = NULL;
 
+// Set by wmain's cleanup just before it closes the data vchan, when nothing more is to be sent: the exit code (the
+// protocol's last message) has gone out, or the peer is gone, or the call is failing or being stopped. A pump still
+// waiting for room then gives up at once (VchanWaitForSendSpace), so the close never waits on a peer that has stopped
+// reading.
+static volatile LONG g_VchanClosing = 0;
+
 static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
 {
     switch (ctrlType)
@@ -307,6 +313,44 @@ DWORD StartChild(
 }
 
 /**
+ * @brief Wait until the data vchan has room for @a size bytes; FALSE if it closed first.
+ *
+ * VchanSendBuffer (windows-utils) waits for room itself, but never checks that the peer is still there: a peer that
+ * goes away while the ring is full (killed mid-transfer) leaves that wait spinning forever, with g_VchanCs held.
+ * VchanSendMessage waits here instead, under the same lock, for the WHOLE message (header and data), so both
+ * VchanSendBuffer calls find their room and never spin, and a message goes out whole or not at all; only the peer
+ * frees room, so nothing can take it in between. It logs the warning VchanSendBuffer logged when it had to wait.
+ * @param vchan Data vchan.
+ * @param size Bytes the next VchanSendBuffer calls will write.
+ * @param what Description of the buffer (for logging).
+ * @return TRUE when there is room, FALSE when the vchan closed.
+ */
+static BOOL VchanWaitForSendSpace(
+    _Inout_ libvchan_t *vchan,
+    _In_ size_t size,
+    _In_ const PWSTR what
+    )
+{
+    if (VchanGetWriteBufferSize(vchan) < (int)size)
+        LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
+    while (VchanGetWriteBufferSize(vchan) < (int)size)
+    {
+        if (!libvchan_is_open(vchan))
+        {
+            LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
+            return FALSE;
+        }
+        if (g_VchanClosing)
+        {
+            LogWarning("the vchan is being closed while %Iu bytes waited for room - not sent", size);
+            return FALSE;
+        }
+        Sleep(1);
+    }
+    return TRUE;
+}
+
+/**
  * @brief Send message to the vchan peer.
  * @param vchan Data vchan.
  * @param messageType Data message type (MSG_DATA_*).
@@ -339,6 +383,9 @@ BOOL VchanSendMessage(
         LogError("vchan is closed");
         goto cleanup;
     }
+
+    if (!VchanWaitForSendSpace(vchan, sizeof(header) + cbData, what))
+        goto cleanup;
 
     if (!VchanSendBuffer(vchan, &header, sizeof(header), L"header"))
     {
@@ -379,9 +426,10 @@ BOOL VchanSendData(
     )
 {
     ULONG messageType;
+    BOOL ok;
 
-    assert(child && child->Vchan);
-    if (!child || !child->Vchan)
+    assert(child);
+    if (!child)
         return FALSE;
 
     LogVerbose("data %p, size %lu, type %d", data, cbData, pipeType);
@@ -399,7 +447,13 @@ BOOL VchanSendData(
         return FALSE;
     }
 
-    return VchanSendMessage(child->Vchan, messageType, data, cbData, L"output data");
+    // child->Vchan is read under g_VchanCs because wmain's cleanup closes the vchan and clears it under that lock
+    // while an output pump may still be running (see there): the pump either finishes this send before the close or
+    // finds NULL after it, never a vchan being or already closed.
+    EnterCriticalSection(&g_VchanCs);
+    ok = child->Vchan && VchanSendMessage(child->Vchan, messageType, data, cbData, L"output data");
+    LeaveCriticalSection(&g_VchanCs);
+    return ok;
 }
 
 /**
@@ -954,11 +1008,7 @@ DWORD EventLoop(
         }
     }
 
-    CloseHandle(child->StdoutThread);
-    child->StdoutThread = NULL;
-    CloseHandle(child->StderrThread);
-    child->StderrThread = NULL;
-
+    // The pump thread handles stay open: wmain's cleanup checks them before freeing the state the pumps use.
     return status;
 }
 
@@ -1146,6 +1196,8 @@ cleanup:
 
     if (child)
     {
+        BOOL pumpsFinished = TRUE;
+
         if (child->Vchan)
         {
             if (libvchan_is_open(child->Vchan))
@@ -1168,11 +1220,39 @@ cleanup:
             // caught spinning on a single-target TLB shootdown, and per-call qrexec churn provokes the
             // guest stall (pre-registered A/Bs, 2026-09-28: SOAK 10/15 vs process-only churn 0/15; stock
             // QWT the same). Releasing it here does the unmap and the close from our own thread, while we
-            // are alive. EventLoop() has already waited for the child and the I/O threads.
+            // are alive.
+            //
+            // Under g_VchanCs, which every send holds: EventLoop returns with the output pumps STILL RUNNING when the
+            // peer hangs up first, on a data error and on a console-control stop, and a pump reads child->Vchan under
+            // that lock (VchanSendData) - so it finishes its send before this close or finds NULL after it, and never
+            // touches a ring being unmapped. A pump waiting for room when the peer has stopped reading gives up on
+            // g_VchanClosing within one poll, so taking the lock here never waits on the peer.
+            InterlockedExchange(&g_VchanClosing, 1);
+            EnterCriticalSection(&g_VchanCs);
             libvchan_close(child->Vchan);
             child->Vchan = NULL;
+            LeaveCriticalSection(&g_VchanCs);
         }
-        free(child);
+
+        // A pump still running here keeps using `child` (its pipe, the pointer above) until it notices, so the state
+        // is freed only when both are known to have finished; otherwise the process exit, next, reclaims it.
+        if (child->StdoutThread)
+        {
+            if (WaitForSingleObject(child->StdoutThread, 0) != WAIT_OBJECT_0)
+                pumpsFinished = FALSE;
+            CloseHandle(child->StdoutThread);
+        }
+        if (child->StderrThread)
+        {
+            if (WaitForSingleObject(child->StderrThread, 0) != WAIT_OBJECT_0)
+                pumpsFinished = FALSE;
+            CloseHandle(child->StderrThread);
+        }
+        if (pumpsFinished)
+            free(child);
+        else
+            LogWarning("an output pump is still running at exit (the peer hung up first, a data error or a stop): "
+                       "its state is left to the process exit");
     }
     if (g_ClosedEvent)
         SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
