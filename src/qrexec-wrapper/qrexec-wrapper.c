@@ -898,10 +898,48 @@ DWORD EventLoop(
             // unless a surviving grandchild still holds one - the same exposure Linux accepts.
             // A generous cap is kept purely as a hang backstop, and if it is ever hit that is a
             // TRUNCATED transfer and must be logged as an error, never as a routine timeout.
-            waitObjects[0] = child->StdoutThread;
-            waitObjects[1] = child->StderrThread;
-
-            status = WaitForMultipleObjects(2, waitObjects, TRUE, DRAIN_TIMEOUT_MS);
+            // The drain ALSO wakes on a console-control stop (WrapperCtrlHandler). Measured 2026-09-29: a wrapper
+            // whose child had exited but whose pipes a DETACHED grandchild still held sat in this wait; the stop
+            // went unseen, the handler's 3 s ran out, and the process exited through the kernel's cleanup after
+            // all. So wait on whichever i/o threads are still running plus the stop event, dropping each thread
+            // as it finishes (a signalled handle left in the set would make the wait return at once forever).
+            BOOL stdoutDone = FALSE, stderrDone = FALSE, stopped = FALSE;
+            ULONGLONG drainEnd = GetTickCount64() + DRAIN_TIMEOUT_MS;
+            status = WAIT_OBJECT_0;
+            while (!(stdoutDone && stderrDone))
+            {
+                HANDLE drain[3];
+                DWORD n = 0, stopIndex;
+                if (!stdoutDone) drain[n++] = child->StdoutThread;
+                if (!stderrDone) drain[n++] = child->StderrThread;
+                stopIndex = n;
+                if (g_StopEvent) drain[n++] = g_StopEvent;
+                ULONGLONG now = GetTickCount64();
+                DWORD left = now >= drainEnd ? 0 : (DWORD)(drainEnd - now);
+                DWORD w = WaitForMultipleObjects(n, drain, FALSE, left);
+                if (w == WAIT_TIMEOUT || w == WAIT_FAILED)
+                {
+                    status = w;
+                    break;
+                }
+                DWORD idx = w - WAIT_OBJECT_0;
+                if (g_StopEvent && idx == stopIndex)
+                {
+                    stopped = TRUE;
+                    break;
+                }
+                if (drain[idx] == child->StdoutThread) stdoutDone = TRUE;
+                else stderrDone = TRUE;
+            }
+            if (stopped)
+            {
+                LogWarning("stop requested by a console control event while draining - leaving now");
+                status = ERROR_OPERATION_ABORTED;
+                CloseHandle(child->Process);
+                child->Process = NULL;
+                run = FALSE;
+                break;
+            }
             if (status == WAIT_TIMEOUT)
                 LogError("i/o threads did not finish within %lu ms: the peer will close the vchan "
                          "on the exit code below, so this transfer is TRUNCATED", DRAIN_TIMEOUT_MS);
