@@ -44,6 +44,40 @@
 #define DRAIN_TIMEOUT_MS (120 * 1000)
 
 static CRITICAL_SECTION g_VchanCs;
+
+// CONSOLE-CONTROL SHUTDOWN (2026-09-29). Measured during a Windows 11 reinstall: two live wrappers were ended with
+// STATUS_CONTROL_C_EXIT by the MSI's Restart Manager, five seconds after the installer had stopped QrexecAgent -
+// wrappers outlive the agent (one was held open by a detached child that inherited its pipes). Without a handler,
+// the default one calls ExitProcess at once and the data vchan's grant mapping is left to the exit-time kernel
+// cleanup, the path the always-close in wmain's cleanup exists to avoid. WrapperCtrlHandler signals g_StopEvent;
+// the main thread leaves its wait, runs that same cleanup on its own thread, and signals g_ClosedEvent.
+#define CTRL_CLOSE_WAIT_MS 3000
+static HANDLE g_StopEvent = NULL;
+static HANDLE g_ClosedEvent = NULL;
+
+static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
+{
+    switch (ctrlType)
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        LogWarning("console control event %lu: closing the data vchan before exiting", ctrlType);
+        if (g_StopEvent)
+            SetEvent(g_StopEvent);
+        if (g_ClosedEvent && WaitForSingleObject(g_ClosedEvent, CTRL_CLOSE_WAIT_MS) == WAIT_OBJECT_0)
+            LogInfo("data vchan closed by our own cleanup after console control event %lu", ctrlType);
+        else
+            LogError("data vchan NOT confirmed closed within %lu ms of console control event %lu - exiting anyway",
+                     CTRL_CLOSE_WAIT_MS, ctrlType);
+        // The status the default handler would have used, so nothing downstream sees a different exit.
+        ExitProcess(STATUS_CONTROL_C_EXIT);
+    default:
+        return FALSE;
+    }
+}
 static BOOL g_exitCodeReceived = FALSE;
 
 /**
@@ -772,18 +806,19 @@ DWORD EventLoop(
     )
 {
     DWORD status = ERROR_NOT_ENOUGH_MEMORY;
-    HANDLE waitObjects[2];
+    HANDLE waitObjects[3];
     DWORD signaled;
     BOOL run = TRUE;
 
     waitObjects[0] = libvchan_fd_for_select(child->Vchan);
     waitObjects[1] = child->Process;
+    waitObjects[2] = g_StopEvent; // console-control shutdown (WrapperCtrlHandler); NULL if it could not be created
 
     // event loop
     while (run)
     {
         LogVerbose("waiting");
-        signaled = WaitForMultipleObjects(2, waitObjects, FALSE, INFINITE) - WAIT_OBJECT_0;
+        signaled = WaitForMultipleObjects(g_StopEvent ? 3 : 2, waitObjects, FALSE, INFINITE) - WAIT_OBJECT_0;
 
         status = ERROR_INVALID_FUNCTION;
 
@@ -882,6 +917,14 @@ DWORD EventLoop(
             run = FALSE;
             break;
         }
+
+        case 2: // console-control shutdown: leave now, wmain's cleanup closes the vchan on this thread
+        {
+            LogWarning("stop requested by a console control event - leaving the event loop");
+            status = ERROR_OPERATION_ABORTED;
+            run = FALSE;
+            break;
+        }
         }
     }
 
@@ -959,6 +1002,13 @@ int wmain(int argc, WCHAR *argv[])
     ZeroMemory(child, sizeof(*child));
 
     InitializeCriticalSection(&g_VchanCs);
+
+    // Before any vchan exists: a console control event from here on closes it through our own cleanup.
+    g_StopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    g_ClosedEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_StopEvent || !g_ClosedEvent || !SetConsoleCtrlHandler(WrapperCtrlHandler, TRUE))
+        LogWarning("console-control shutdown not armed (error 0x%x): a control event will exit without closing the data vchan",
+                   GetLastError());
     libvchan_register_logger(XifLogger, LogGetLevel());
 
     domain = _wtoi(domainName);
@@ -987,7 +1037,14 @@ int wmain(int argc, WCHAR *argv[])
         BOOL run = TRUE;
         while (run)
         {
-            DWORD signaled = WaitForSingleObject(libvchan_fd_for_select(child->Vchan), INFINITE);
+            HANDLE waits[2] = { libvchan_fd_for_select(child->Vchan), g_StopEvent };
+            DWORD signaled = WaitForMultipleObjects(g_StopEvent ? 2 : 1, waits, FALSE, INFINITE);
+            if (signaled == WAIT_OBJECT_0 + 1)
+            {
+                LogWarning("stop requested by a console control event");
+                status = ERROR_OPERATION_ABORTED;
+                goto cleanup;
+            }
             if (signaled != WAIT_OBJECT_0)
             {
                 status = (DWORD)-1;
@@ -1086,6 +1143,8 @@ cleanup:
         }
         free(child);
     }
+    if (g_ClosedEvent)
+        SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
 
     return status;
 }
