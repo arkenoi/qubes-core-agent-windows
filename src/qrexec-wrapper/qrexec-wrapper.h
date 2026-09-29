@@ -63,4 +63,8 @@ typedef struct _CHILD_STATE
     libvchan_t   *Vchan;
 
     BOOL         IsVchanServer;
+
+    // Our MSG_HELLO has gone out on the data vchan (the server sends it in InitVchan, the client replies to the peer's).
+    // The final cleanup sends one only if not: a second hello on a vchan that already carried data is a protocol error.
+    BOOL         HelloSent;
 } CHILD_STATE, *PCHILD_STATE;
