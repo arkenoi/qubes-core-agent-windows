@@ -1648,7 +1648,18 @@ DWORD WINAPI ServiceExecutionThread(void* param)
     // VchanInitServer / HandleDaemonMessage failure) made the service stop with exit code 0, so
     // the SCM failure actions armed by the installer never fired and QrexecAgent stayed Stopped
     // for the rest of the boot. A stop request and a daemon disconnect still return 0 (unchanged).
-    // (service.c must forward this code to SetServiceStatus for the restart to actually happen.)
+    //
+    // THIS RETURN ALONE WAS NOT ENOUGH, and it was the whole fix for a while: windows-utils'
+    // SvcMainLoop (src/service.c, the wrapper this worker runs under - and the qubesdb daemon's)
+    // reported SERVICE_STOPPED with NO_ERROR whatever the worker returned, its SvcSetState ignoring
+    // the exit code it was handed. So every worker failure still ended as a clean stop: no event
+    // 7023/7024, no SCM recovery, even with FailureActionsOnNonCrashFailures set (health-check.ps1
+    // 2b, audit #34). The forwarding lives in the QWT build's windows-utils patch
+    // (patches/windows-utils-service-exit-code.patch in the main repo, applied by both build
+    // workflows; proven offline by tools/tests/svc-exitcode-selftest.sh): the SCM is told the Win32
+    // code returned here, logs event 7023 with its text, and runs the installer's restart actions.
+    // Return Win32 error codes from this thread, never a private enumeration - they are what the
+    // event text renders.
     return status;
 }
 
