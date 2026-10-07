@@ -1549,7 +1549,15 @@ DWORD ProcessAutostarts()
     status = CfgReadMultiString(moduleName, REG_CONFIG_AUTOSTART_VALUE, autostarts, buffer_length, NULL);
     if (ERROR_SUCCESS != status)
     {
-        win_perror2(status, "CfgReadMultiString(" REG_CONFIG_AUTOSTART_VALUE L")");
+        // THE VALUE IS OPTIONAL, and not having it is the normal configuration: ERROR_FILE_NOT_FOUND here
+        // means "no autostart entries", not "the read failed". It went through win_perror2, which logs at
+        // ERROR, so every boot of every guest wrote an error line about a value nobody had set - two of the
+        // eleven error lines a fresh boot of our own guest carried on 2026-10-07. A REAL read failure
+        // (access denied, the wrong value type, a buffer too small) is still an error and still says so.
+        if (ERROR_FILE_NOT_FOUND == status)
+            LogInfo("no " REG_CONFIG_AUTOSTART_VALUE L" configured - nothing to autostart");
+        else
+            win_perror2(status, "CfgReadMultiString(" REG_CONFIG_AUTOSTART_VALUE L")");
         status = ERROR_SUCCESS; // this is non-fatal
         goto cleanup;
     }
