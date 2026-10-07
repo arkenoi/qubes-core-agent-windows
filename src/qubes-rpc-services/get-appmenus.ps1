@@ -70,8 +70,14 @@ Function GetHash($string)
 
 $script:EmittedIds = @{}
 $script:EmittedNames = @{}
+$script:RecommendedIds = @()
 
-# ---------------------------------------------------------------- what is NOT an application
+# ------------------------------------------- which entries a fresh qube should have ENABLED
+#
+# NOT which are reported. Everything found is reported, always - see the note in Sweep. These
+# folders are the ones whose contents are system administration consoles rather than applications,
+# and the only thing they shape is the RECOMMENDED DEFAULT SELECTION this script writes to its log,
+# which an admin can hand to dom0 as `menu-items`. Availability is untouched.
 #
 # MEASURED on win11de-qwt (German 25H2, 26200.8037) 2026-10-07: the sweep below reported 38
 # entries and TWENTY of them - more than half the menu - came from one Start Menu folder,
@@ -81,14 +87,17 @@ $script:EmittedNames = @{}
 # Monitor, Security Configuration Management, services, System Configuration, System Information,
 # Task Scheduler, Windows Defender Firewall with Advanced Security.
 #
-# That is what a FRESHLY CREATED qube shows, because dom0 displays everything we report until
-# someone writes a whitelist, and a whitelist can only ever be a SUBSET of this list
-# (qubesappmenus/receive.py never takes a default from the guest). So the first thing a user saw
-# in a new Windows qube's menu was twenty MMC snap-ins with the real applications buried in them.
+# That is what a FRESHLY CREATED qube shows, because dom0 enables everything available until
+# somebody makes a selection, and it never takes that selection from the guest. So the first thing
+# a user saw in a new Windows qube's menu was twenty MMC snap-ins with the real applications buried
+# among them.
 #
-# Nothing becomes unreachable: every one of those is one word in Command Prompt (Administrator)
-# or Run Terminal, both reported as built-ins below, and the folder is still in the guest's own
-# Start Menu when the qube runs non-seamlessly.
+# THE FIX IS THE DEFAULT SELECTION, NOT THE REPORT. An earlier version of this file dropped these
+# twenty from the report, which also dropped them from dom0's AVAILABLE list, which meant nobody
+# could ever tick them in Settings -> Applications again. The owner rejected that, correctly: "you
+# silently dropped most of the apps and tell me that it is fine?" Availability is the user's choice
+# and this service does not get to make it. All of them are reported; the list below only decides
+# what the logged recommendation leaves OUT.
 #
 # The folder name is matched LITERALLY, which is correct on a localized Windows: the measurement
 # above is a German guest and its paths still read
@@ -243,6 +252,8 @@ Function ProcessLink($pathObj, $basepath)
         Emit-Entry $id 'Icon' $targetHash
         $script:EmittedIds[(Get-QwtIdKey $id)] = $true
         $script:EmittedNames[(Get-QwtNameKey $menuName)] = $true
+        # reported either way; only the RECOMMENDATION skips the administration folders
+        if (-not (Test-QwtMenuExcluded $relativePath)) { $script:RecommendedIds += "$id.desktop" }
     } catch {
         # One unreadable shortcut must not cost the user every other application.
         LogWarning "skipping shortcut '$($pathObj.FullName)': $($_.Exception.Message)"
@@ -260,15 +271,20 @@ Function Sweep($folderName)
             LogWarning "start menu folder '$folderName' not present - skipping"
             return
         }
+        # EVERY shortcut is reported. What this service prints becomes dom0's AVAILABLE list
+        # (qubesappmenus get_available_filenames: one .desktop template per entry reported), and
+        # both selection paths are list comprehensions OVER that list - `menu-items` and
+        # whitelisted-appmenus.list can only ever NARROW it, never add to it. So an entry we do not
+        # report is one nobody can ever tick in Settings -> Applications.
+        #
+        # This loop briefly EXCLUDED the Administrative Tools folder - 20 of the 28 shortcuts on the
+        # measured guest - to make a fresh qube's menu usable. That was the wrong fix and the owner
+        # rejected it: "you silently dropped most of the apps and tell me that it is fine?" The
+        # problem was never which apps are AVAILABLE, it was which are ENABLED BY DEFAULT, and the
+        # lever for that is dom0's `menu-items` / `default-menu-items` - a stated prerequisite,
+        # exactly like `vmexec` and `qrexec_timeout` already are. See docs/QVM-FEATURES.md.
         $shortcuts = @(Get-ChildItem -Path $p -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)
-        $excluded = 0
-        foreach ($s in $shortcuts) {
-            if (Test-QwtMenuExcluded (Get-QwtMenuRelativePath $s.FullName $p)) { $excluded++; continue }
-            ProcessLink $s $p
-        }
-        if ($excluded -gt 0) {
-            LogInfo "'$folderName': $excluded of $($shortcuts.Count) shortcuts are in a system administration folder ($($script:ExcludedMenuFolders -join ', ')) and are not reported as applications"
-        }
+        foreach ($s in $shortcuts) { ProcessLink $s $p }
     } catch {
         LogWarning "sweep of '$folderName' failed: $($_.Exception.Message)"
     }
@@ -352,9 +368,32 @@ try {
         Emit-Entry $b.id 'Icon' $hash
         $script:EmittedIds[(Get-QwtIdKey $b.id)] = $true
         $script:EmittedNames[(Get-QwtNameKey $b.name)] = $true
+        $script:RecommendedIds += "$($b.id).desktop"
     }
 } catch {
     LogWarning "built-in entries failed: $($_.Exception.Message)"
+}
+
+# ---------------------------------------------------------- the recommended default selection
+#
+# To the LOG, never to stdout: dom0 parses stdout and prints "Warning: ignoring key" for anything
+# it does not recognise, so a recommendation on stdout would be noise in the admin's own output.
+#
+# Everything above is AVAILABLE. This line says which of it is worth having ENABLED on a fresh
+# qube, and dom0 is the only place that can be set (qubesappmenus reads `menu-items` on the qube,
+# else `default-menu-items` inherited from its template, else shows everything available; it never
+# takes a default from the guest). It is a stated prerequisite, like `vmexec` and `qrexec_timeout`
+# - we ship nothing into dom0 and run nothing there. docs/QVM-FEATURES.md has the whole story.
+try {
+    $rec = @($script:RecommendedIds | Sort-Object -Unique)
+    $all = $script:EmittedIds.Count
+    if ($rec.Count -gt 0 -and $rec.Count -lt $all) {
+        LogInfo "MENU-RECOMMENDATION $($rec.Count) of $all reported entries are applications; the rest are system administration consoles. All $all stay AVAILABLE. For a clean default menu, in dom0: qvm-features <qube> menu-items '$($rec -join ' ')'  (or default-menu-items on its template, which new AppVMs inherit)"
+    } else {
+        LogInfo "MENU-RECOMMENDATION all $all reported entries look like applications - no default selection needed"
+    }
+} catch {
+    LogWarning "could not compose the menu recommendation: $($_.Exception.Message)"
 }
 
 # ALWAYS 0. See the header: a non-zero exit here is what dom0 turns into
