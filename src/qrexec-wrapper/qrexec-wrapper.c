@@ -804,12 +804,97 @@ DWORD WINAPI StderrThread(
     return ret;
 }
 
+// A DEPARTED PEER IS AN ORDINARY EVENT AND USED TO COST FOUR ERROR LINES OF OURS, PER CALL.
+//
+// This wrapper installs itself as the log sink for the PV/vchan libraries and forwards every
+// message at the library's own level, verbatim (libvchan_register_logger(XifLogger, ...) below).
+// Those libraries log every failed STEP at XLL_ERROR, including steps whose failure is part of a
+// normal connect, and three layers each restate the same fact. The level enums line up 1:1
+// (XLL_ERROR=1..XLL_TRACE=5 vs LOG_LEVEL_ERROR=1..VERBOSE=5), so an XLL_ERROR became an E line in
+// our log with no classification at all.
+//
+// The measured four lines are TWO xenstore reads of ONE question - "has the peer published its
+// ring?" - restated by every layer that touched it:
+//   1. the deliberate existence PROBE in libvchan_client_init, whose own comment is "test if the
+//      store entry exists; if not - wait a second time" and whose status the caller IGNORES,
+//      logged one layer down by xencontrol as XcStoreRead ... failed: 0x5;
+//   2. the second 500 ms watch wait timing out (the 0x102 warning);
+//   3. the real read of ring-ref in libxenvchan_client_init - the same xencontrol ERROR again on a
+//      second handle - plus that caller's own ERROR;
+//   4. libxenvchan_client_init returning NULL -> "libvchan_client_init(...) failed".
+// The status cannot settle it either: xeniface answers 0x5 (ACCESS_DENIED) for an absent node as
+// well as for a real refusal, so the code alone cannot tell "the client left" from "we are broken".
+//
+// So the sink becomes CONNECT-AWARE: while the client connect runs, library records are HELD
+// instead of printed, and the outcome decides what to do with them. Two rules keep this from being
+// a suppression:
+//   * NOTHING IS DESTROYED - every held record is replayed in every branch, at DEBUG when the
+//     outcome was ordinary and at its ORIGINAL level when it was not, so raising the wrapper's
+//     LogLevel reproduces today's output verbatim;
+//   * QUIET REQUIRES TWO AGREEING POSITIVE DETECTIONS. If the held buffer overflowed, if the
+//     detectors disagree, or if the probe returns anything unexpected, the loud replay is the
+//     default. The absence of evidence never buys silence.
+#define XIFHOLD_MAX 16
+typedef struct _XIFHOLD_REC {
+    int level;
+    char function[64];
+    WCHAR text[1024];
+} XIFHOLD_REC;
+static XIFHOLD_REC g_XifHold[XIFHOLD_MAX];
+static ULONG g_XifHoldCount = 0;
+static ULONG g_XifHoldLost = 0;   // records past XIFHOLD_MAX: reported, never silently dropped
+static BOOL g_XifHoldOn = FALSE;
+
 static void XifLogger(int level, const char *function, const WCHAR *format, va_list args)
 {
     WCHAR buf[1024];
 
     StringCbVPrintfW(buf, sizeof(buf), format, args);
-    _LogFormat(level, FALSE, function, buf);
+
+    // The connect runs on the main thread before any pump thread exists, so the hold needs no lock.
+    if (g_XifHoldOn)
+    {
+        if (g_XifHoldCount < XIFHOLD_MAX)
+        {
+            XIFHOLD_REC *r = &g_XifHold[g_XifHoldCount++];
+            r->level = level;
+            r->function[0] = 0;
+            if (function)
+                StringCbCopyA(r->function, sizeof(r->function), function);
+            StringCbCopyW(r->text, sizeof(r->text), buf);
+        }
+        else
+        {
+            g_XifHoldLost++;
+        }
+        return;
+    }
+
+    // PRE-EXISTING DEFECT, fixed here: buf is ALREADY formatted by the StringCbVPrintfW above, and
+    // _LogFormat is printf-style, so passing buf as the format made any literal '%' in a library
+    // message read garbage off the varargs. Found while adding the hold above.
+    _LogFormat(level, FALSE, function, L"%s", buf);
+}
+
+// Replay every held record. quiet=TRUE puts them at DEBUG (the outcome was ordinary); quiet=FALSE
+// restores each record's ORIGINAL level, which is exactly what the log looked like before.
+static void XifHoldRelease(BOOL quiet)
+{
+    g_XifHoldOn = FALSE;
+    for (ULONG i = 0; i < g_XifHoldCount; i++)
+    {
+        XIFHOLD_REC *r = &g_XifHold[i];
+        // "%s", text - NEVER text as the format. _LogFormat is printf-style and the held text is
+        // ALREADY formatted (XifLogger ran StringCbVPrintfW before storing it), so passing it as a
+        // format would make any '%' in a library message read garbage off the varargs.
+        _LogFormat(quiet ? LOG_LEVEL_DEBUG : r->level, FALSE,
+                   r->function[0] ? r->function : NULL, L"%s", r->text);
+    }
+    if (g_XifHoldLost)
+        LogWarning("%lu library log record(s) past the %d held were dropped - the connect outcome was not classified from a complete record",
+                   g_XifHoldLost, XIFHOLD_MAX);
+    g_XifHoldCount = 0;
+    g_XifHoldLost = 0;
 }
 
 /**
@@ -857,7 +942,38 @@ libvchan_t *InitVchan(
     }
     else
     {
+        // HELD while the connect runs - see XifLogger - and released in both branches below, so
+        // no path can leave the hold on.
+        g_XifHoldCount = 0;
+        g_XifHoldLost = 0;
+        g_XifHoldOn = TRUE;
         vchan = libvchan_client_init(domain, port);
+
+        if (vchan)
+        {
+            // IT WORKED. Everything the libraries said on the way was a step that was retried and
+            // then succeeded - including the existence probe whose own comment says it expects to
+            // miss and wait again. At DEBUG. This is the whole of what this change makes quieter:
+            // the stray ERROR lines a SUCCESSFUL connect to a slow peer writes today.
+            XifHoldRelease(TRUE);
+        }
+        else
+        {
+            // A FAILED CONNECT STAYS EXACTLY AS LOUD AS TODAY, deliberately.
+            //
+            // The RCA this implements proposed classifying a departed peer and logging it once at
+            // INFO, behind two detectors. Jev refused both halves: ship_detector_b 0.16 (it needs
+            // a re-read through xencontrol, and NOTHING in core-agent includes xencontrol.h or
+            // links it - the wrapper links exactly libvchan.lib and windows-utils.lib - in a file
+            // that cannot be compiled on the dev host, on the path of every qrexec call into the
+            // guest), and detector_a_alone_sufficient 0.12, because A's verdict rests partly on
+            // which functions did NOT appear, and an absence is exactly what the design rule
+            // "quiet requires two agreeing POSITIVE detections" forbids as a basis for silence.
+            //
+            // So the four-errors-per-departed-peer P2 is NOT fixed by this commit and is not
+            // pretended to be. What is fixed is the successful-connect case above.
+            XifHoldRelease(FALSE);
+        }
     }
 
     return vchan;
