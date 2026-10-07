@@ -69,6 +69,130 @@ Function GetHash($string)
 }
 
 $script:EmittedIds = @{}
+$script:EmittedNames = @{}
+
+# ---------------------------------------------------------------- what is NOT an application
+#
+# MEASURED on win11de-qwt (German 25H2, 26200.8037) 2026-10-07: the sweep below reported 38
+# entries and TWENTY of them - more than half the menu - came from one Start Menu folder,
+# "Administrative Tools": Component Services, Computer Management, dfrgui, Disk Cleanup, Event
+# Viewer, iSCSI Initiator, Memory Diagnostics Tool, ODBC Data Sources (32-bit), ODBC Data Sources
+# (64-bit), Performance Monitor, Print Management, RecoveryDrive, Registry Editor, Resource
+# Monitor, Security Configuration Management, services, System Configuration, System Information,
+# Task Scheduler, Windows Defender Firewall with Advanced Security.
+#
+# That is what a FRESHLY CREATED qube shows, because dom0 displays everything we report until
+# someone writes a whitelist, and a whitelist can only ever be a SUBSET of this list
+# (qubesappmenus/receive.py never takes a default from the guest). So the first thing a user saw
+# in a new Windows qube's menu was twenty MMC snap-ins with the real applications buried in them.
+#
+# Nothing becomes unreachable: every one of those is one word in Command Prompt (Administrator)
+# or Run Terminal, both reported as built-ins below, and the folder is still in the guest's own
+# Start Menu when the qube runs non-seamlessly.
+#
+# The folder name is matched LITERALLY, which is correct on a localized Windows: the measurement
+# above is a German guest and its paths still read
+# "...\Start Menu\Programs\Administrative Tools\..." - Windows localizes the DISPLAYED folder
+# name through desktop.ini and leaves the directory name alone.
+$script:ExcludedMenuFolders = @(
+    'Administrative Tools'          # Win11, and Win10 1809+
+    'Windows Administrative Tools'  # the same folder's Win10 1703-1803 spelling
+)
+
+# Pure. Exactly what Emit-Entry will put on the wire for a value. dom0 decodes each line as ASCII
+# and DROPS the line if it is not, and reads at most 1024 bytes of it - see the header.
+Function Get-QwtSafeValue($value)
+{
+    $safe = ("$value" -replace '[^\x20-\x7E]', '')
+    if ($safe.Length -gt 400) { $safe = $safe.Substring(0, 400) }
+    return $safe
+}
+
+# Pure. The key an id is remembered under, so an id inserted by one path and looked up by another
+# is the SAME key. The two sides disagreed: scanned entries inserted a sanitised, lower-cased id
+# while the built-in check looked its own up raw - it only ever worked because every built-in id
+# happens to be lower-case already.
+Function Get-QwtIdKey($id)
+{
+    return (("$id" -replace '[^a-zA-Z0-9._-]', '_')).ToLowerInvariant()
+}
+
+# Pure. The key a DISPLAYED name is remembered under: what dom0 will actually receive, lower-cased.
+# Going through Get-QwtSafeValue is the point, not tidiness - two names are the same menu label iff
+# their keys match. Keying on the RAW name let two shortcuts emit one identical label while the
+# collision check saw two different strings, because the umlaut it compared on never reaches dom0:
+# "Zubehor" with an o-umlaut arrives as "Zubehr". On a German guest that is the norm, not an edge.
+Function Get-QwtNameKey($name)
+{
+    return (Get-QwtSafeValue $name).ToLowerInvariant()
+}
+
+# Pure. The path of a shortcut RELATIVE to the Start Menu root it was found under.
+Function Get-QwtMenuRelativePath($fullPath, $basePath)
+{
+    $b = "$basePath".TrimEnd('\', '/')
+    if ($b.Length -gt 0 -and $fullPath.Length -gt ($b.Length + 1) -and
+        $fullPath.Substring(0, $b.Length) -eq $b) {
+        return $fullPath.Substring($b.Length + 1)
+    }
+    return [System.IO.Path]::GetFileName($fullPath)
+}
+
+# Pure. Is this shortcut in a folder that holds system administration consoles rather than
+# applications? Only DIRECTORY components are considered - a file's own name never excludes it.
+Function Test-QwtMenuExcluded($relativePath)
+{
+    if (-not $relativePath) { return $false }
+    $parts = @($relativePath -split '[\\/]')
+    for ($i = 0; $i -lt ($parts.Count - 1); $i++) {
+        foreach ($ex in $script:ExcludedMenuFolders) {
+            if ($parts[$i] -eq $ex) { return $true }
+        }
+    }
+    return $false
+}
+
+# Pure. The label the user sees. The folder prefix belongs in the desktop-entry ID, where it makes
+# the id unique - putting it in the NAME is what produced, in the same measurement,
+# "Windows PowerShell Windows PowerShell ISE", "Accessories-System Tools Character Map" and
+# "Administrative Tools dfrgui". Use the shortcut's own name, and fall back to the prefixed form
+# only when a different shortcut already took it, so two entries are never labelled identically.
+Function Get-QwtMenuName($relativePath, $baseName, $takenNames)
+{
+    $candidates = @("$baseName")
+    $parts = @("$relativePath" -split '[\\/]')
+    if ($parts.Count -gt 1) {
+        $dir = ($parts[0..($parts.Count - 2)] -join '-')
+        if ($dir) { $candidates += "$dir $baseName" }
+    }
+    if (-not $takenNames) { return $candidates[0] }
+    foreach ($c in $candidates) {
+        if (-not $takenNames.ContainsKey((Get-QwtNameKey $c))) { return $c }
+    }
+    # Every form is taken, which has a real cause and not only a contrived one: two shortcuts whose
+    # names differ ONLY in characters dom0 never receives are one single label by the time they
+    # arrive - "Zubehor" with an o-umlaut and "Zubehr" both reach the menu as "Zubehr", and a
+    # shortcut at the Programs root has no folder to fall back on either. Number it rather than
+    # emit a second entry the user cannot tell apart. Bounded, because this service must not hang.
+    $last = $candidates[$candidates.Count - 1]
+    for ($n = 2; $n -le 99; $n++) {
+        $c = "$last ($n)"
+        if (-not $takenNames.ContainsKey((Get-QwtNameKey $c))) { return $c }
+    }
+    return $last
+}
+
+# Pure. Would reporting this built-in duplicate something the Start Menu sweep already reported?
+# ID *or* the name the user would see - the id-only test let "Microsoft Edge" into the menu TWICE
+# in the 2026-10-07 measurement: "Programs\Microsoft Edge.lnk" is id Microsoft_Edge and the
+# built-in is id edge, so the ids never collided, while both lines read Name=Microsoft Edge and
+# the entries were indistinguishable in dom0's menu.
+Function Test-QwtBuiltinRedundant($id, $name, $emittedIds, $emittedNames)
+{
+    if ($emittedIds -and $emittedIds.ContainsKey((Get-QwtIdKey $id))) { return 'id' }
+    if ($emittedNames -and $emittedNames.ContainsKey((Get-QwtNameKey $name))) { return 'name' }
+    return ''
+}
 
 # One output line, ASCII-only and length-capped, because dom0 silently discards anything else.
 Function Emit-Entry($id, $key, $value)
@@ -78,9 +202,7 @@ Function Emit-Entry($id, $key, $value)
     # stock except where we mean it. Keep the suffix.
     $safeId = (($id -replace '[^a-zA-Z0-9._-]', '_'))
     if ($safeId -notlike '*.desktop') { $safeId = "$safeId.desktop" }
-    $safeValue = ($value -replace '[^\x20-\x7E]', '')
-    if ($safeValue.Length -gt 400) { $safeValue = $safeValue.Substring(0, 400) }
-    Write-Host "$($safeId):$key=$safeValue"
+    Write-Host "$($safeId):$key=$(Get-QwtSafeValue $value)"
 }
 
 Function Set-AppMap($name, $value)
@@ -93,13 +215,9 @@ Function Set-AppMap($name, $value)
 Function ProcessLink($pathObj, $basepath)
 {
     try {
-        $desktopFileName = ($pathObj.FullName).SubString($basepath.Length+1).Replace(' ', '_').Replace('\','-')
+        $relativePath = Get-QwtMenuRelativePath $pathObj.FullName $basepath
+        $desktopFileName = $relativePath.Replace(' ', '_').Replace('\','-')
         $linkBaseName = $desktopFileName.Replace('.lnk', '.desktop') # fixme: check if it's at the end of the string
-        if ($pathObj.DirectoryName -ne $basepath) {
-            $appmenuLocation = $pathObj.DirectoryName.SubString($basepath.Length+1).Replace('\','-') + " "
-        } else {
-            $appmenuLocation = ""
-        }
 
         $description = ''
         if ($WshShell) {
@@ -118,11 +236,13 @@ Function ProcessLink($pathObj, $basepath)
         LogDebug "$targetHash -> $targetPath"
 
         $id = $linkBaseName.Replace('.desktop','')
-        Emit-Entry $id 'Name' "$appmenuLocation$($pathObj.BaseName)"
+        $menuName = Get-QwtMenuName $relativePath $pathObj.BaseName $script:EmittedNames
+        Emit-Entry $id 'Name' $menuName
         Emit-Entry $id 'Exec' $targetPath.Replace('\','\\')
         Emit-Entry $id 'Comment' $description
         Emit-Entry $id 'Icon' $targetHash
-        $script:EmittedIds[($id -replace '[^a-zA-Z0-9._-]', '_').ToLowerInvariant()] = $true
+        $script:EmittedIds[(Get-QwtIdKey $id)] = $true
+        $script:EmittedNames[(Get-QwtNameKey $menuName)] = $true
     } catch {
         # One unreadable shortcut must not cost the user every other application.
         LogWarning "skipping shortcut '$($pathObj.FullName)': $($_.Exception.Message)"
@@ -140,8 +260,15 @@ Function Sweep($folderName)
             LogWarning "start menu folder '$folderName' not present - skipping"
             return
         }
-        $shortcuts = Get-ChildItem -Path $p -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue
-        $shortcuts | ForEach-Object { ProcessLink $_ $p }
+        $shortcuts = @(Get-ChildItem -Path $p -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)
+        $excluded = 0
+        foreach ($s in $shortcuts) {
+            if (Test-QwtMenuExcluded (Get-QwtMenuRelativePath $s.FullName $p)) { $excluded++; continue }
+            ProcessLink $s $p
+        }
+        if ($excluded -gt 0) {
+            LogInfo "'$folderName': $excluded of $($shortcuts.Count) shortcuts are in a system administration folder ($($script:ExcludedMenuFolders -join ', ')) and are not reported as applications"
+        }
     } catch {
         LogWarning "sweep of '$folderName' failed: $($_.Exception.Message)"
     }
@@ -200,9 +327,13 @@ try {
         $builtins += @{ id = 'edge'; name = 'Microsoft Edge'; icon = $edge; comment = 'Web browser' }
     }
 
+    # The sweep ran first, so where a built-in and a real shortcut collide the guest's own shortcut
+    # wins - which keeps its localized description, and it launches through AppMap exactly like
+    # every other scanned entry.
     foreach ($b in $builtins) {
-        if ($script:EmittedIds.ContainsKey($b.id)) {
-            LogDebug "built-in '$($b.id)' already provided by a Start Menu shortcut - skipping"
+        $redundant = Test-QwtBuiltinRedundant $b.id $b.name $script:EmittedIds $script:EmittedNames
+        if ($redundant) {
+            LogDebug "built-in '$($b.id)' already provided by a Start Menu shortcut (same $redundant) - skipping"
             continue
         }
         # The icon source doubles as the AppMap value, exactly like a .lnk path does, so
@@ -219,6 +350,8 @@ try {
         Emit-Entry $b.id 'Exec' "qubes-rpc-multiplexer qubes.StartApp+$($b.id)"
         Emit-Entry $b.id 'Comment' $b.comment
         Emit-Entry $b.id 'Icon' $hash
+        $script:EmittedIds[(Get-QwtIdKey $b.id)] = $true
+        $script:EmittedNames[(Get-QwtNameKey $b.name)] = $true
     }
 } catch {
     LogWarning "built-in entries failed: $($_.Exception.Message)"
