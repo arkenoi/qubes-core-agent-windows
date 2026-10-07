@@ -126,6 +126,20 @@ Function Get-QwtIdKey($id)
     return (("$id" -replace '[^a-zA-Z0-9._-]', '_')).ToLowerInvariant()
 }
 
+# Pure. The desktop-entry NAME dom0 will end up with - what Emit-Entry prints before the colon, and
+# therefore the only string `menu-items` can be matched against (receive.py keys the whitelist on
+# os.path.basename). Shared with Emit-Entry rather than re-derived: the recommendation below was
+# built from the RAW id and so named "Windows_PowerShell-Windows_PowerShell_ISE_(x86).desktop",
+# while the line actually emitted reads "..._ISE__x86_.desktop". `menu-items` ignores a name it
+# cannot match, silently, so an admin pasting that value would have lost that one entry from the
+# menu with nothing to indicate why. Measured on the guest 2026-10-07.
+Function Get-QwtDesktopName($id)
+{
+    $safe = ("$id" -replace '[^a-zA-Z0-9._-]', '_')
+    if ($safe -notlike '*.desktop') { $safe = "$safe.desktop" }
+    return $safe
+}
+
 # Pure. The key a DISPLAYED name is remembered under: what dom0 will actually receive, lower-cased.
 # Going through Get-QwtSafeValue is the point, not tidiness - two names are the same menu label iff
 # their keys match. Keying on the RAW name let two shortcuts emit one identical label while the
@@ -209,8 +223,7 @@ Function Emit-Entry($id, $key, $value)
     # Stock emits "<name>.desktop:Key=Value" and dom0's parser makes the suffix optional, so both
     # shapes work - but the whole point of this fork is that its output is indistinguishable from
     # stock except where we mean it. Keep the suffix.
-    $safeId = (($id -replace '[^a-zA-Z0-9._-]', '_'))
-    if ($safeId -notlike '*.desktop') { $safeId = "$safeId.desktop" }
+    $safeId = Get-QwtDesktopName $id
     Write-Host "$($safeId):$key=$(Get-QwtSafeValue $value)"
 }
 
@@ -253,7 +266,7 @@ Function ProcessLink($pathObj, $basepath)
         $script:EmittedIds[(Get-QwtIdKey $id)] = $true
         $script:EmittedNames[(Get-QwtNameKey $menuName)] = $true
         # reported either way; only the RECOMMENDATION skips the administration folders
-        if (-not (Test-QwtMenuExcluded $relativePath)) { $script:RecommendedIds += "$id.desktop" }
+        if (-not (Test-QwtMenuExcluded $relativePath)) { $script:RecommendedIds += (Get-QwtDesktopName $id) }
     } catch {
         # One unreadable shortcut must not cost the user every other application.
         LogWarning "skipping shortcut '$($pathObj.FullName)': $($_.Exception.Message)"
@@ -368,7 +381,7 @@ try {
         Emit-Entry $b.id 'Icon' $hash
         $script:EmittedIds[(Get-QwtIdKey $b.id)] = $true
         $script:EmittedNames[(Get-QwtNameKey $b.name)] = $true
-        $script:RecommendedIds += "$($b.id).desktop"
+        $script:RecommendedIds += (Get-QwtDesktopName $b.id)
     }
 } catch {
     LogWarning "built-in entries failed: $($_.Exception.Message)"
