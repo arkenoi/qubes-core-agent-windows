@@ -61,6 +61,14 @@ static HANDLE g_ClosedEvent = NULL;
 // reading.
 static volatile LONG g_VchanClosing = 0;
 
+// IS THERE A DATA VCHAN TO CLOSE AT ALL? The console-control handler waits for the cleanup to
+// confirm the close, and reports an ERROR when it does not - which is right when a mapping could be
+// left for the kernel to reclaim at process exit, and meaningless when there was never a vchan. The
+// commonest case of the latter is the one this log was full of: a client that went away before
+// libvchan_client_init could connect, where nothing was ever mapped and nothing will ever signal
+// the close. Set after InitVchan succeeds, cleared once the cleanup has closed it.
+static volatile LONG g_VchanOpen = 0;
+
 static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
 {
     switch (ctrlType)
@@ -75,9 +83,20 @@ static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
             SetEvent(g_StopEvent);
         if (g_ClosedEvent && WaitForSingleObject(g_ClosedEvent, CTRL_CLOSE_WAIT_MS) == WAIT_OBJECT_0)
             LogInfo("data vchan closed by our own cleanup after console control event %lu", ctrlType);
+        else if (!g_VchanOpen)
+            // NOTHING TO CONFIRM. No data vchan is open - it was never created (the commonest case:
+            // a client that went away before libvchan_client_init could connect) or the cleanup has
+            // already closed it. Nothing is mapped, so nothing can be left for the kernel to
+            // reclaim at process exit, and no cleanup will ever signal the close.
+            LogInfo("no data vchan to close at console control event %lu - exiting", ctrlType);
         else
-            LogError("data vchan NOT confirmed closed within %lu ms of console control event %lu - exiting anyway",
-                     CTRL_CLOSE_WAIT_MS, ctrlType);
+            // A MAPPING MAY BE LEFT BEHIND. This is the case the always-close in the cleanup exists
+            // for: the ring's grant mapping and the event channel are reclaimed during process exit
+            // instead, from a system worker attached to the dying process - the path the 2026-08-20
+            // NMI dump caught spinning on a TLB shootdown.
+            LogError("data vchan NOT confirmed closed within %lu ms of console control event %lu (cleanup %s) - "
+                     L"exiting anyway, so its mapping is reclaimed at process exit",
+                     CTRL_CLOSE_WAIT_MS, ctrlType, g_VchanClosing ? L"had begun closing it" : L"never reached the close");
         // The status the default handler would have used, so nothing downstream sees a different exit.
         ExitProcess(STATUS_CONTROL_C_EXIT);
     default:
@@ -1287,6 +1306,7 @@ int wmain(int argc, WCHAR *argv[])
     child->Vchan = InitVchan(domain, port, child->IsVchanServer);
     if (!child->Vchan)
         goto cleanup;
+    InterlockedExchange(&g_VchanOpen, 1);
     if (child->IsVchanServer)
         child->HelloSent = TRUE; // InitVchan sent the server's hello (it fails otherwise)
 
@@ -1417,6 +1437,7 @@ cleanup:
             EnterCriticalSection(&g_VchanCs);
             libvchan_close(child->Vchan);
             child->Vchan = NULL;
+            InterlockedExchange(&g_VchanOpen, 0);
             LeaveCriticalSection(&g_VchanCs);
         }
 
