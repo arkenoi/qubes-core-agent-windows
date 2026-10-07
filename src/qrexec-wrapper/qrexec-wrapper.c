@@ -86,6 +86,35 @@ static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
 }
 static BOOL g_exitCodeReceived = FALSE;
 
+// WHY THE EVENT LOOP ENDED. The cleanup has to say whether an output pump still running at exit is
+// expected or a loss, and it could not: it printed one warning asserting three possible causes
+// ("the peer hung up first, a data error or a stop") without knowing which. On a guest-initiated
+// call the ordinary end is the peer closing the vchan, which never reaches the post-exit drain, so
+// the pumps ARE still running and every successful call logged that warning - 229 of them in one
+// boot, 226 inside two minutes.
+typedef enum {
+    EXIT_REASON_UNSET = 0,
+    EXIT_REASON_PEER_CLOSED,     // the peer finished and closed the vchan: the ordinary end
+    EXIT_REASON_CHILD_DRAINED,   // our child exited and both pumps were waited for
+    EXIT_REASON_DATA_ERROR,      // HandleDataMessage failed
+    EXIT_REASON_DRAIN_EXPIRED,   // the 120 s backstop: already reported as a TRUNCATED transfer
+    EXIT_REASON_CTRL_STOP,       // a console control event asked us to stop
+} EXIT_REASON;
+static EXIT_REASON g_exitReason = EXIT_REASON_UNSET;
+
+static const WCHAR *ExitReasonName(EXIT_REASON r)
+{
+    switch (r)
+    {
+    case EXIT_REASON_PEER_CLOSED:   return L"the peer closed the vchan";
+    case EXIT_REASON_CHILD_DRAINED: return L"the child exited and its output was drained";
+    case EXIT_REASON_DATA_ERROR:    return L"a data error";
+    case EXIT_REASON_DRAIN_EXPIRED: return L"the drain backstop expired";
+    case EXIT_REASON_CTRL_STOP:     return L"a console control stop";
+    default:                        return L"not recorded";
+    }
+}
+
 /**
  * @brief Create an anonymous pipe that will be used as one of the std handles for a child process.
  * @param pipeData Pipe data to initialize.
@@ -1035,6 +1064,11 @@ DWORD EventLoop(
                     LogDebug("vchan closed - drained %lu buffered message(s) before exit", drained);
                 else
                     LogDebug("vchan closed");
+                // This is the ORDINARY end of a guest-initiated call, so it must not leave the
+                // ERROR_INVALID_FUNCTION set at the top of this pass: that was returned to wmain
+                // and became the process exit code of every successful call.
+                status = ERROR_SUCCESS;
+                g_exitReason = EXIT_REASON_PEER_CLOSED;
                 run = FALSE;
                 break;
             }
@@ -1043,7 +1077,10 @@ DWORD EventLoop(
             {
                 status = HandleDataMessage(child);
                 if (status != ERROR_SUCCESS)
+                {
+                    g_exitReason = EXIT_REASON_DATA_ERROR;
                     run = FALSE;
+                }
             }
             break;
         }
@@ -1118,14 +1155,18 @@ DWORD EventLoop(
             {
                 LogWarning("stop requested by a console control event while draining - leaving now");
                 status = ERROR_OPERATION_ABORTED;
+                g_exitReason = EXIT_REASON_CTRL_STOP;
                 CloseHandle(child->Process);
                 child->Process = NULL;
                 run = FALSE;
                 break;
             }
             if (status == WAIT_TIMEOUT)
+            {
+                g_exitReason = EXIT_REASON_DRAIN_EXPIRED;
                 LogError("i/o threads did not finish within %lu ms: the peer will close the vchan "
                          "on the exit code below, so this transfer is TRUNCATED", DRAIN_TIMEOUT_MS);
+            }
             else if (status == WAIT_FAILED)
                 win_perror2(GetLastError(), "wait for i/o threads");
 
@@ -1133,6 +1174,8 @@ DWORD EventLoop(
                 LogError("sending exit code failed");
 
             status = ERROR_SUCCESS;
+            if (g_exitReason == EXIT_REASON_UNSET)
+                g_exitReason = EXIT_REASON_CHILD_DRAINED;
             CloseHandle(child->Process);
             child->Process = NULL;
             run = FALSE;
@@ -1143,6 +1186,7 @@ DWORD EventLoop(
         {
             LogWarning("stop requested by a console control event - leaving the event loop");
             status = ERROR_OPERATION_ABORTED;
+            g_exitReason = EXIT_REASON_CTRL_STOP;
             run = FALSE;
             break;
         }
@@ -1392,9 +1436,20 @@ cleanup:
         }
         if (pumpsFinished)
             free(child);
+        else if (g_exitReason == EXIT_REASON_PEER_CLOSED || g_exitReason == EXIT_REASON_CHILD_DRAINED)
+            // Expected: the loop left on the ordinary end, which does not wait for the pumps. The
+            // peer has what it asked for and the state is reclaimed by the process exit.
+            LogDebug("an output pump is still running at exit - %s; its state is left to the process exit",
+                     ExitReasonName(g_exitReason));
+        else if (g_exitReason == EXIT_REASON_DRAIN_EXPIRED)
+            // Already reported above as a TRUNCATED transfer; saying it twice buries the first one.
+            LogDebug("an output pump is still running at exit - %s (reported above)",
+                     ExitReasonName(g_exitReason));
         else
-            LogWarning("an output pump is still running at exit (the peer hung up first, a data error or a stop): "
-                       "its state is left to the process exit");
+            // A data error, a stop, or a reason nobody recorded: output this call produced may
+            // never have reached the peer, and nothing else says so.
+            LogError("an output pump is still running at exit - %s: output this call produced may "
+                     "not have reached the peer", ExitReasonName(g_exitReason));
     }
     if (g_ClosedEvent)
         SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
