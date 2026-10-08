@@ -69,9 +69,23 @@ $before = (Get-Date).ToUniversalTime()
 $skew = [math]::Round(($utc - $before).TotalSeconds, 1)
 
 try {
-    # Set-Date takes a DateTime and honours its Kind, so a Utc value sets the clock in UTC terms
-    # rather than writing a UTC instant into the guest's local frame.
-    Set-Date -Date $utc -ErrorAction Stop | Out-Null
+    # CORRECTED 2026-10-08, MEASURED ON A FIELD-FAITHFUL GUEST. This line used to pass $utc with the
+    # comment "Set-Date takes a DateTime and honours its Kind, so a Utc value sets the clock in UTC
+    # terms rather than writing a UTC instant into the guest's local frame." THAT IS FALSE.
+    # Set-Date sets the LOCAL clock from the value's components (it ends in Win32 SetLocalTime); the
+    # DateTimeKind is not consulted. So handing it a Utc value of 15:05:09 on a UTC+2 guest set LOCAL
+    # time to 15:05:09, making the guest read 13:05:09 UTC - off by exactly the zone offset, and the
+    # correction made the skew WORSE each pass.
+    #
+    # WHY IT WAS NEVER SEEN HERE: every rig guest runs UTC, where the offset is zero and the bug is
+    # invisible. It was found on a clone built to match a German reporter's template (Europe/Berlin,
+    # +2 in October): a boot-scoped measurement of his environment carried exactly one ERROR, and it
+    # was this - "SETTIME the clock did not take: asked for ...T15:05:09Z, it reads ...T13:05:09Z -
+    # still -7200 s out (was -3604.3 s out before)".
+    #
+    # ToLocalTime() converts the instant into this guest's frame, which is what Set-Date wants. The
+    # verification below still compares in UTC, so a zone this gets wrong cannot pass silently.
+    Set-Date -Date $utc.ToLocalTime() -ErrorAction Stop | Out-Null
 } catch {
     LogError "SETTIME Set-Date to $($utc.ToString('o')) failed: $($_.Exception.Message) - the clock is UNCHANGED (was off by $skew s)"
     exit 1
