@@ -441,7 +441,18 @@ BOOL VchanSendMessage(
 
     if (!libvchan_is_open(vchan))
     {
-        LogError("vchan is closed");
+        // THE PEER IS GONE, and whether that COSTS anything depends on what we were about to send.
+        // This line used to be "vchan is closed" and nothing else - no message type, no size, no
+        // description - so the ordinary end (the client hung up after taking the exit code) and a
+        // real loss of output were indistinguishable, and it was one of the eight undeclared error
+        // lines a clean startup/shutdown cycle produced on win11r-logvol, 2026-10-08. cbData == 0 is
+        // the trailing EOF marker (see the `cbData == 0 // EOF` branch below): there is nothing in
+        // it to lose. Anything with bytes pending IS a loss and still says so, now with the amount.
+        if (cbData == 0)
+            LogDebug("vchan already closed, nothing left to send: msg 0x%x (%s)", messageType, what);
+        else
+            LogError("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - that "
+                L"output does not reach the peer", cbData, what, messageType);
         goto cleanup;
     }
 
