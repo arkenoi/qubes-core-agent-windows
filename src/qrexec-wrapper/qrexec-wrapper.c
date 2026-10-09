@@ -448,8 +448,16 @@ BOOL VchanSendMessage(
         // lines a clean startup/shutdown cycle produced on win11r-logvol, 2026-10-08. cbData == 0 is
         // the trailing EOF marker (see the `cbData == 0 // EOF` branch below): there is nothing in
         // it to lose. Anything with bytes pending IS a loss and still says so, now with the amount.
+        // MEASURED 2026-10-09 on a current build: four of the five error lines a clean capture
+        // carried were this one for `4 byte(s) of hello (msg 0x300)`. A handshake is not OUTPUT -
+        // when the peer departs before it, nothing a user had is lost; the request was already dead
+        // and QGAVCHANFAIL's condition has simply arrived one step later. The discriminator is the
+        // message TYPE, a positive fact, not an absence. Pending CHILD OUTPUT is still a real loss
+        // and still an error, with the amount.
         if (cbData == 0)
             LogDebug("vchan already closed, nothing left to send: msg 0x%x (%s)", messageType, what);
+        else if (messageType == MSG_HELLO)
+            LogWarning("peer gone before the handshake (msg 0x%x); request never served", messageType);
         else
             LogError("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - that "
                 L"output does not reach the peer", cbData, what, messageType);
@@ -826,7 +834,11 @@ static DWORD handle_child_output(
         {
             if (!VchanSendData(child, buffer, nread, pipe_type))
             {
-                LogError("VchanSendData failed");
+                // Every failure path inside VchanSendData logs what failed and what it cost (the
+                // closed peer with the byte count, the header send, the wait for space), so this
+                // line only ever restated the one above it - the same two-lines-for-one-condition
+                // the collapse exists to remove.
+                LogDebug("VchanSendData failed; output pump ends");
                 goto cleanup;
             }
         }
