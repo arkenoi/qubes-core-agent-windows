@@ -1011,7 +1011,7 @@ static BOOL XifIsHexW(WCHAR c)
 // while naming no cause at all cost interpretability (0.55). Citing the register's PATH in the
 // line was measured too and was worse on both counts (overclaim 0.41, repo_path_in_product_log
 // 0.40, blocker 0.61), so the tag carries it instead.
-typedef enum { XIFSHAPE_NONE = 0, XIFSHAPE_STORE, XIFSHAPE_EVTCHN, XIFSHAPE_OTHER } XIFSHAPE;
+typedef enum { XIFSHAPE_NONE = 0, XIFSHAPE_STORE, XIFSHAPE_EVTCHN, XIFSHAPE_GRANT, XIFSHAPE_OTHER } XIFSHAPE;
 
 static XIFSHAPE XifHoldShape(const WCHAR **rec)
 {
@@ -1039,6 +1039,21 @@ static XIFSHAPE XifHoldShape(const WCHAR **rec)
         {
             *rec = g_XifHold[i].text;
             return XIFSHAPE_EVTCHN;
+        }
+    }
+    // A THIRD SHAPE, FOUND BY THE FALLBACK WORDING ON A GUEST (2026-10-09). Five of thirteen
+    // collapsed lines came back "cause not recognised", and their records named something this code
+    // did not know: "IOCTL_XENIFACE_GNTTAB_MAP_FOREIGN_PAGES_V2 failed: 0x1f" then "Mapping ring
+    // (ref 41445) from domain 10858 failed" - the peer's GRANT, not the xenstore node and not the
+    // event channel. Had the first draft's wording shipped, all five would have claimed the node
+    // could not be read, which their own records contradict. This is why the fallback says what it
+    // does not know instead of guessing.
+    for (i = 0; i < g_XifHoldCount; i++)
+    {
+        if (wcsstr(g_XifHold[i].text, L"Mapping ring") && wcsstr(g_XifHold[i].text, L"failed"))
+        {
+            *rec = g_XifHold[i].text;
+            return XIFSHAPE_GRANT;
         }
     }
     return XIFSHAPE_OTHER;
@@ -1156,6 +1171,11 @@ static void XifHoldReleaseCollapsed(int domain, int port)
                         peer, port,
                         XifRecSays0x5(rec) ? L" (0x5 = gone or not ours)"
                                            : L"");
+        break;
+    case XIFSHAPE_GRANT:
+        StringCbPrintfW(line, sizeof(line),
+                        L"QGAVCHANFAIL vchan to %s port %d never opened: its ring could not be mapped; request dropped.",
+                        peer, port);
         break;
     case XIFSHAPE_NONE:
         StringCbPrintfW(line, sizeof(line),
