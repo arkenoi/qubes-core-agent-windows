@@ -956,46 +956,154 @@ static void XifHoldRelease(BOOL quiet)
     g_XifHoldLost = 0;
 }
 
-// A THIRD OUTCOME: COLLAPSE. Owner, 2026-10-09, shown one real failed call line by line: "the
-// question if all four lines are informative in the log, or we may collapse them to a single failure
-// path" - having already ruled "i prefer to keep this in logs but do not send any dom0 messages, and
-// certainly not four of them, each of misleading nature".
-//
-// THEY ARE NOT FOUR FACTS. Measured on win10-acc at uptime 21 s for
-// `qrexec-wrapper.exe 10858|513|(null)|6|cmd.exe`, the sequence is one question restated by three
-// layers:
-//   E XcStoreRead: IOCTL_XENIFACE_STORE_READ failed: 0x5        <- the PROBE's read; NO key named
-//   W libvchan_client_init: Wait for xenstore (2) failed: 0x102 <- the probe waited (already a W)
-//   E XcStoreRead: IOCTL_XENIFACE_STORE_READ failed: 0x5        <- identical text, still no key
-//   E libxenvchan_client_init: failed to read '<path>/ring-ref' from store: 0x5  <- key AND status
-//   E libvchan_client_init: libxenvchan_client_init(10858, <path>) failed        <- no status
-// The last restates the one above it with LESS detail; the second XcStoreRead is that line's own
-// inner report; the first is an EXPECTED probe miss at ERROR while the very next line says the probe
-// is waiting. Every distinct text fits in one line.
-//
-// WHY THIS NEEDS NO DETECTOR, which is what separates it from the five refusals recorded in the
-// branch below. Those proposed deciding the outcome was ORDINARY and then being QUIET, and that
-// refusal stands: 0x5 means both "no such node" and "refused", so the decision would rest on an
-// absence. THIS DECIDES NOTHING ABOUT THE OUTCOME. The connect failed, it is still reported at
-// ERROR, on every path, with every fact. Only the restating stops.
-//
-// NOTHING IS DESTROYED, the same contract as the quiet branch: every DISTINCT held text goes into
-// the single ERROR line with its repeat count, and then every held record is replayed at DEBUG, so
-// raising LogLevel reproduces the library's own sequence verbatim. The four failure exits of
-// libxenvchan_client_init that log NOTHING are covered too, because this line is emitted from the
-// FAILURE and names the domain and port even when the libraries said nothing - today those paths
-// are reported only by the single line this replaces.
+// A failed vchan connect is ONE error line, not four restatements of it, and that line says in
+// words what happened. Owner, 2026-10-09: keep it in the guest log, send NO dom0 message ("and
+// certainly not four of them, each of misleading nature"), and "it is better to have diagnostic
+// line which is interpretable by human like 'vchan prematurely closed by dom0'". The measured
+// four-line sequence, why it is one fact restated by three layers, and why this collapse needs no
+// quiet-mode detector are in findings/issues.md (QGAVCHANFAIL). Nothing is destroyed: every
+// DISTINCT held text reaches the line with its repeat count, and every record is replayed verbatim
+// at DEBUG.
+
+static BOOL XifIsHexW(WCHAR c)
+{
+    return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F');
+}
+
+// WHAT THE LINE MAY SAY, and what it may not. The first draft of this said "vchan prematurely
+// closed by dom0", which is the owner's own phrasing - and Jev refused it: wording_overclaims 0.81,
+// classifier_sound 0.23, because a departed peer is an INFERENCE. What is OBSERVED is only that the
+// xenstore node could not be read (status 0x5, which xeniface returns both for "no such node" and
+// for "not permitted") or that the event channel could not be bound. So the line states the
+// observation, in words, and says what follows from it. The KNOWN cause - a peer that departs
+// mid-connect - is NOT asserted here and is recorded in findings/issues.md under this line's own
+// QGAVCHANFAIL tag, which is how a reader gets from the line to the RCA. Five Jev rounds settled
+// that: asserting the cause scored causal-hint-remains 0.94 and wording_overclaims 0.71-0.81,
+// while naming no cause at all cost interpretability (0.55). Citing the register's PATH in the
+// line was measured too and was worse on both counts (overclaim 0.41, repo_path_in_product_log
+// 0.40, blocker 0.61), so the tag carries it instead.
+typedef enum { XIFSHAPE_NONE = 0, XIFSHAPE_STORE, XIFSHAPE_EVTCHN, XIFSHAPE_OTHER } XIFSHAPE;
+
+static XIFSHAPE XifHoldShape(const WCHAR **rec)
+{
+    ULONG i;
+
+    *rec = NULL;
+    if (g_XifHoldCount == 0)
+        return XIFSHAPE_NONE;
+    for (i = 0; i < g_XifHoldCount; i++)
+    {
+        if (wcsstr(g_XifHold[i].text, L"ring-ref"))
+        {
+            *rec = g_XifHold[i].text;
+            return XIFSHAPE_STORE;
+        }
+    }
+    for (i = 0; i < g_XifHoldCount; i++)
+    {
+        if (wcsstr(g_XifHold[i].text, L"failed to bind event channel"))
+        {
+            *rec = g_XifHold[i].text;
+            return XIFSHAPE_EVTCHN;
+        }
+    }
+    return XIFSHAPE_OTHER;
+}
+
+// The one piece of interpretation a reader genuinely cannot do unaided, and it is NOT an inference:
+// xeniface returns 0x5 for a node that is ABSENT just as it does for one we may not read, so the
+// status alone does not say which. The clause is added only when the record's status really is 0x5,
+// so it can never describe a different status. ": 0x5" must not match ": 0x50".
+static BOOL XifRecSays0x5(const WCHAR *rec)
+{
+    const WCHAR *p = rec ? wcsstr(rec, L": 0x5") : NULL;
+
+    return (p != NULL) && !XifIsHexW(p[5]);
+}
+
+// Copy a library record, dropping the parenthesised handle values ("(000002B3CFBFBA90) ") - 57 of
+// the 397 characters of a real four-record line, and meaningless to a reader. The HELD text is left
+// alone, so the DEBUG replay stays verbatim.
+static void XifCopyWithoutHandles(WCHAR *dst, size_t cb, const WCHAR *src)
+{
+    size_t n = cb / sizeof(WCHAR);
+    size_t o = 0;
+    const WCHAR *p = src;
+
+    while (*p && o + 1 < n)
+    {
+        if (*p == L'(')
+        {
+            const WCHAR *q = p + 1;
+            while (XifIsHexW(*q))
+                q++;
+            if (*q == L')' && (q - p) >= 9)   // at least 8 hex digits: a handle, not prose
+            {
+                p = q + 1;
+                while (*p == L' ')
+                    p++;
+                continue;
+            }
+        }
+        dst[o++] = *p++;
+    }
+    dst[o] = 0;
+}
+
 static void XifHoldReleaseCollapsed(int domain, int port)
 {
     WCHAR line[2048];
     WCHAR part[1200];
+    WCHAR clean[1024];
+    WCHAR peer[96];
+    const WCHAR *rec;
+    XIFSHAPE shape;
     ULONG i, j, reps;
     ULONG omitted = 0;
     BOOL seen;
 
-    StringCbPrintfW(line, sizeof(line),
-                    L"QGAVCHANFAIL libvchan_client_init(%d, %d) failed - one report for %lu library record(s):",
-                    domain, port, g_XifHoldCount);
+    // Name the peer the way a reader thinks of it. It is NOT always dom0: a service requested by
+    // another qube is a direct VM-to-VM vchan, and the server is that qube - measured, the failing
+    // path was /local/domain/10858/data/vchan/13831/513, where 10858 is the CALLING qube and 13831
+    // is this guest. Saying "dom0" there would be the misleading kind of line.
+    if (domain == 0)
+        StringCbCopyW(peer, sizeof(peer), L"dom0");
+    else
+        StringCbPrintfW(peer, sizeof(peer), L"the requesting peer (domain %d)", domain);
+
+    // The sentence answers, in this order: what failed, who the other end was, what was actually
+    // seen, and whether the reader has anything to do about it. Only the third part varies, and an
+    // absence of records never becomes a claim about the shape.
+    shape = XifHoldShape(&rec);
+    switch (shape)
+    {
+    case XIFSHAPE_STORE:
+        StringCbPrintfW(line, sizeof(line),
+                        L"QGAVCHANFAIL vchan for this request never opened: the xenstore node %s publishes for port %d could not be read%s. The request is not served. %lu library record(s):",
+                        peer, port,
+                        XifRecSays0x5(rec) ? L" - status 0x5, which means the node is either absent or not readable by us"
+                                           : L"",
+                        g_XifHoldCount);
+        break;
+    case XIFSHAPE_EVTCHN:
+        StringCbPrintfW(line, sizeof(line),
+                        L"QGAVCHANFAIL vchan for this request never opened: its event channel to %s on port %d could not be bound%s. The request is not served. %lu library record(s):",
+                        peer, port,
+                        XifRecSays0x5(rec) ? L" - status 0x5, which means the channel is either gone or not ours to bind"
+                                           : L"",
+                        g_XifHoldCount);
+        break;
+    case XIFSHAPE_NONE:
+        StringCbPrintfW(line, sizeof(line),
+                        L"QGAVCHANFAIL vchan for this request never opened: to %s, port %d, and the libraries reported nothing at all, so why is not known here. The request is not served.",
+                        peer, port);
+        break;
+    default:
+        StringCbPrintfW(line, sizeof(line),
+                        L"QGAVCHANFAIL vchan for this request never opened: to %s, port %d, in neither of the two shapes this code recognises, so the records below are all that is known about why. The request is not served. %lu library record(s):",
+                        peer, port, g_XifHoldCount);
+        break;
+    }
     for (i = 0; i < g_XifHoldCount; i++)
     {
         seen = FALSE;
@@ -1016,10 +1124,11 @@ static void XifHoldReleaseCollapsed(int domain, int port)
             if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
                 reps++;
         }
+        XifCopyWithoutHandles(clean, sizeof(clean), g_XifHold[i].text);
         if (reps > 1)
-            StringCbPrintfW(part, sizeof(part), L" | %s (x%lu)", g_XifHold[i].text, reps);
+            StringCbPrintfW(part, sizeof(part), L" | %s (x%lu)", clean, reps);
         else
-            StringCbPrintfW(part, sizeof(part), L" | %s", g_XifHold[i].text);
+            StringCbPrintfW(part, sizeof(part), L" | %s", clean);
         // TRUNCATION IS NEVER SILENT. StringCbCatW truncates and returns
         // STRSAFE_E_INSUFFICIENT_BUFFER, and ignoring that would drop a fact from the one line that
         // is now the whole report - the exact loss this change exists to avoid. On overflow the
@@ -1040,8 +1149,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
         // every record, and g_XifHoldLost covers anything the hold itself could not take.
         (void)StringCbCatW(line, sizeof(line), tail);
     }
-    if (g_XifHoldCount == 0)
-        (void)StringCbCatW(line, sizeof(line), L" (the libraries logged nothing at all)");
+    // (the empty-hold case is said in the opening sentence above, not appended here)
 
     // The same call shape as the replay: _LogFormat is printf-style and `line` is ALREADY formatted,
     // so it is an ARGUMENT to L"%s" and never the format itself.
