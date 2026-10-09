@@ -893,7 +893,12 @@ DWORD WINAPI StderrThread(
 //   * QUIET REQUIRES TWO AGREEING POSITIVE DETECTIONS. If the held buffer overflowed, if the
 //     detectors disagree, or if the probe returns anything unexpected, the loud replay is the
 //     default. The absence of evidence never buys silence.
-#define XIFHOLD_MAX 16
+// MEASURED ON A GUEST 2026-10-09, which is how this number was chosen rather than guessed: at
+// LogLevel 4 a client connect emits 20 records on the failing path and 27 on the succeeding one, so
+// a 16-slot hold overflowed on EVERY connect - and because the hold is first-come-first-served, what
+// it dropped was the diagnostic TAIL: the ring-ref status and libvchan's own verdict. One line built
+// from that is worse than four lines, so the hold now takes a whole sequence with headroom.
+#define XIFHOLD_MAX 64
 typedef struct _XIFHOLD_REC {
     int level;
     char function[64];
@@ -950,8 +955,20 @@ static void XifHoldRelease(BOOL quiet)
                    r->function[0] ? r->function : NULL, L"%s", r->text);
     }
     if (g_XifHoldLost)
-        LogWarning("%lu library log record(s) past the %d held were dropped - the connect outcome was not classified from a complete record",
-                   g_XifHoldLost, XIFHOLD_MAX);
+    {
+        // The wording used to say the OUTCOME was not classified from a complete record, which is
+        // false on the path that reaches here after a SUCCESSFUL connect: the outcome is known and
+        // the records were going to DEBUG anyway, so an overflow costs replay detail and nothing
+        // else. It was measured firing on every successful connect at LogLevel 4. The failing path
+        // reports its own overflow INSIDE the one error line, where it changes what the line means,
+        // and clears the counter before it gets here.
+        if (quiet)
+            LogDebug("%lu library record(s) past the %d held were not replayed - the connect SUCCEEDED, so this costs replay detail only",
+                     g_XifHoldLost, XIFHOLD_MAX);
+        else
+            LogWarning("%lu library log record(s) past the %d held were dropped",
+                       g_XifHoldLost, XIFHOLD_MAX);
+    }
     g_XifHoldCount = 0;
     g_XifHoldLost = 0;
 }
@@ -993,7 +1010,12 @@ static XIFSHAPE XifHoldShape(const WCHAR **rec)
         return XIFSHAPE_NONE;
     for (i = 0; i < g_XifHoldCount; i++)
     {
-        if (wcsstr(g_XifHold[i].text, L"ring-ref"))
+        // "ring-ref" ALONE matches the DEBUG records that merely name the path being read
+        // ("Path: '<...>/ring-ref'") and the one that reports success ("ring-ref 45679,
+        // event-channel 29"). Measured on a guest: at LogLevel 4 the shape test picked one of those
+        // and the line then said the node "could not be read" while the records showed it HAD been
+        // read, with its value. The failure record is the one that also says so.
+        if (wcsstr(g_XifHold[i].text, L"ring-ref") && wcsstr(g_XifHold[i].text, L"failed"))
         {
             *rec = g_XifHold[i].text;
             return XIFSHAPE_STORE;
@@ -1021,14 +1043,20 @@ static BOOL XifRecSays0x5(const WCHAR *rec)
     return (p != NULL) && !XifIsHexW(p[5]);
 }
 
-// Copy a library record, dropping the parenthesised handle values ("(000002B3CFBFBA90) ") - 57 of
-// the 397 characters of a real four-record line, and meaningless to a reader. The HELD text is left
-// alone, so the DEBUG replay stays verbatim.
-static void XifCopyWithoutHandles(WCHAR *dst, size_t cb, const WCHAR *src)
+// Copy a library record so it can live INSIDE one line: drop the parenthesised handle values
+// ("(000002B3CFBFBA90) ", 57 of the 397 characters of a real four-record sequence and meaningless to
+// a reader), and fold every run of whitespace - including the record's OWN TRAILING NEWLINE - into a
+// single space. MEASURED ON A GUEST 2026-10-09: the library's format strings end in "\n", so
+// concatenating the records produced a "single" line that the log wrote as FOUR physical lines,
+// three of them with no timestamp and no level prefix - which is worse to read than the four lines
+// this replaces, and made the line look truncated. The HELD text is never modified, so the DEBUG
+// replay still reproduces the library's own output verbatim.
+static void XifCopyForLine(WCHAR *dst, size_t cb, const WCHAR *src)
 {
     size_t n = cb / sizeof(WCHAR);
     size_t o = 0;
     const WCHAR *p = src;
+    BOOL lastWasSpace = FALSE;
 
     while (*p && o + 1 < n)
     {
@@ -1045,8 +1073,21 @@ static void XifCopyWithoutHandles(WCHAR *dst, size_t cb, const WCHAR *src)
                 continue;
             }
         }
+        if (*p == L'\r' || *p == L'\n' || *p == L'\t' || *p == L' ')
+        {
+            if (!lastWasSpace && o > 0)
+            {
+                dst[o++] = L' ';
+                lastWasSpace = TRUE;
+            }
+            p++;
+            continue;
+        }
+        lastWasSpace = FALSE;
         dst[o++] = *p++;
     }
+    while (o > 0 && dst[o - 1] == L' ')   // no trailing space running into the next " | "
+        o--;
     dst[o] = 0;
 }
 
@@ -1124,7 +1165,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
             if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
                 reps++;
         }
-        XifCopyWithoutHandles(clean, sizeof(clean), g_XifHold[i].text);
+        XifCopyForLine(clean, sizeof(clean), g_XifHold[i].text);
         if (reps > 1)
             StringCbPrintfW(part, sizeof(part), L" | %s (x%lu)", clean, reps);
         else
@@ -1139,6 +1180,18 @@ static void XifHoldReleaseCollapsed(int domain, int port)
             omitted++;
             continue;
         }
+    }
+    if (g_XifHoldLost)
+    {
+        // Said HERE, not by the release below: on this path an overflow means the one report was
+        // built from an incomplete sequence, which a reader has to know to judge the diagnosis
+        // above. The counter is cleared so the release does not report it a second time.
+        WCHAR lost[160];
+        StringCbPrintfW(lost, sizeof(lost),
+                        L" | ...and %lu record(s) past the %d held were DROPPED, so this report is INCOMPLETE",
+                        g_XifHoldLost, XIFHOLD_MAX);
+        (void)StringCbCatW(line, sizeof(line), lost);
+        g_XifHoldLost = 0;
     }
     if (omitted)
     {
