@@ -963,10 +963,10 @@ static void XifHoldRelease(BOOL quiet)
         // reports its own overflow INSIDE the one error line, where it changes what the line means,
         // and clears the counter before it gets here.
         if (quiet)
-            LogDebug("%lu library record(s) past the %d held were not replayed - the connect SUCCEEDED, so this costs replay detail only",
+            LogDebug("%lu record(s) past %d not replayed; connect succeeded",
                      g_XifHoldLost, XIFHOLD_MAX);
         else
-            LogWarning("%lu library log record(s) past the %d held were dropped",
+            LogWarning("%lu record(s) past %d dropped",
                        g_XifHoldLost, XIFHOLD_MAX);
     }
     g_XifHoldCount = 0;
@@ -1100,6 +1100,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     const WCHAR *rec;
     XIFSHAPE shape;
     ULONG i, j, reps;
+    ULONG shown;
     ULONG omitted = 0;
     BOOL seen;
 
@@ -1110,47 +1111,73 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     if (domain == 0)
         StringCbCopyW(peer, sizeof(peer), L"dom0");
     else
-        StringCbPrintfW(peer, sizeof(peer), L"the requesting peer (domain %d)", domain);
+        StringCbPrintfW(peer, sizeof(peer), L"domain %d", domain);
 
     // The sentence answers, in this order: what failed, who the other end was, what was actually
     // seen, and whether the reader has anything to do about it. Only the third part varies, and an
     // absence of records never becomes a claim about the shape.
+    // THE LINE CARRIES WHAT WOULD HAVE BEEN PRINTED, not the whole hold. Owner 2026-10-09: "your
+    // error messages are terrible in style: way too many words" - and most of the hold is the
+    // libraries' own DEBUG bookkeeping ("Path: 'domid'", "Value: '13879'", "Watch handle: ..."),
+    // which nothing printed before this code existed. Those stay in the DEBUG replay, where they
+    // were always going. Nothing is lost at any level: below DEBUG they were never printed; at
+    // DEBUG the replay carries every record verbatim.
+    for (i = 0, shown = 0; i < g_XifHoldCount; i++)
+    {
+        if (g_XifHold[i].level <= LOG_LEVEL_WARNING)
+            shown++;
+    }
+
     shape = XifHoldShape(&rec);
     switch (shape)
     {
     case XIFSHAPE_STORE:
         StringCbPrintfW(line, sizeof(line),
-                        L"QGAVCHANFAIL vchan for this request never opened: the xenstore node %s publishes for port %d could not be read%s. The request is not served. %lu library record(s):",
+                        L"QGAVCHANFAIL vchan to %s port %d never opened: xenstore node unreadable%s; request dropped.",
                         peer, port,
-                        XifRecSays0x5(rec) ? L" - status 0x5, which means the node is either absent or not readable by us"
-                                           : L"",
-                        g_XifHoldCount);
+                        XifRecSays0x5(rec) ? L" (0x5 = absent or denied)"
+                                           : L"");
         break;
     case XIFSHAPE_EVTCHN:
         StringCbPrintfW(line, sizeof(line),
-                        L"QGAVCHANFAIL vchan for this request never opened: its event channel to %s on port %d could not be bound%s. The request is not served. %lu library record(s):",
+                        L"QGAVCHANFAIL vchan to %s port %d never opened: event channel unbindable%s; request dropped.",
                         peer, port,
-                        XifRecSays0x5(rec) ? L" - status 0x5, which means the channel is either gone or not ours to bind"
-                                           : L"",
-                        g_XifHoldCount);
+                        XifRecSays0x5(rec) ? L" (0x5 = gone or not ours)"
+                                           : L"");
         break;
     case XIFSHAPE_NONE:
         StringCbPrintfW(line, sizeof(line),
-                        L"QGAVCHANFAIL vchan for this request never opened: to %s, port %d, and the libraries reported nothing at all, so why is not known here. The request is not served.",
+                        L"QGAVCHANFAIL vchan to %s port %d never opened, libraries said nothing; request dropped.",
                         peer, port);
         break;
     default:
         StringCbPrintfW(line, sizeof(line),
-                        L"QGAVCHANFAIL vchan for this request never opened: to %s, port %d, in neither of the two shapes this code recognises, so the records below are all that is known about why. The request is not served. %lu library record(s):",
-                        peer, port, g_XifHoldCount);
+                        L"QGAVCHANFAIL vchan to %s port %d never opened, cause not recognised; request dropped.",
+                        peer, port);
         break;
+    }
+    if (shown > 0)
+    {
+        WCHAR head[64];
+        StringCbPrintfW(head, sizeof(head), L" %lu/%lu records:", shown, g_XifHoldCount);
+        (void)StringCbCatW(line, sizeof(line), head);
+    }
+    else if (g_XifHoldCount > 0)
+    {
+        WCHAR head[80];
+        StringCbPrintfW(head, sizeof(head), L" %lu records held, all DEBUG - see replay", g_XifHoldCount);
+        (void)StringCbCatW(line, sizeof(line), head);
     }
     for (i = 0; i < g_XifHoldCount; i++)
     {
+        if (g_XifHold[i].level > LOG_LEVEL_WARNING)
+            continue;   // the libraries' DEBUG bookkeeping: in the replay, not in this line
+
         seen = FALSE;
         for (j = 0; j < i; j++)
         {
-            if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
+            if (g_XifHold[j].level <= LOG_LEVEL_WARNING &&
+                0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
             {
                 seen = TRUE;
                 break;
@@ -1162,7 +1189,8 @@ static void XifHoldReleaseCollapsed(int domain, int port)
         reps = 0;
         for (j = i; j < g_XifHoldCount; j++)
         {
-            if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
+            if (g_XifHold[j].level <= LOG_LEVEL_WARNING &&
+                0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
                 reps++;
         }
         XifCopyForLine(clean, sizeof(clean), g_XifHold[i].text);
@@ -1188,7 +1216,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
         // above. The counter is cleared so the release does not report it a second time.
         WCHAR lost[160];
         StringCbPrintfW(lost, sizeof(lost),
-                        L" | ...and %lu record(s) past the %d held were DROPPED, so this report is INCOMPLETE",
+                        L" | +%lu past %d dropped: INCOMPLETE",
                         g_XifHoldLost, XIFHOLD_MAX);
         (void)StringCbCatW(line, sizeof(line), lost);
         g_XifHoldLost = 0;
@@ -1196,7 +1224,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     if (omitted)
     {
         WCHAR tail[128];
-        StringCbPrintfW(tail, sizeof(tail), L" | ...%lu more distinct record(s) did not fit - see the DEBUG replay",
+        StringCbPrintfW(tail, sizeof(tail), L" | +%lu did not fit (see DEBUG)",
                         omitted);
         // If even this does not fit the line is already at its bound; the DEBUG replay still carries
         // every record, and g_XifHoldLost covers anything the hold itself could not take.
