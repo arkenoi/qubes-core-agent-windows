@@ -956,6 +956,101 @@ static void XifHoldRelease(BOOL quiet)
     g_XifHoldLost = 0;
 }
 
+// A THIRD OUTCOME: COLLAPSE. Owner, 2026-10-09, shown one real failed call line by line: "the
+// question if all four lines are informative in the log, or we may collapse them to a single failure
+// path" - having already ruled "i prefer to keep this in logs but do not send any dom0 messages, and
+// certainly not four of them, each of misleading nature".
+//
+// THEY ARE NOT FOUR FACTS. Measured on win10-acc at uptime 21 s for
+// `qrexec-wrapper.exe 10858|513|(null)|6|cmd.exe`, the sequence is one question restated by three
+// layers:
+//   E XcStoreRead: IOCTL_XENIFACE_STORE_READ failed: 0x5        <- the PROBE's read; NO key named
+//   W libvchan_client_init: Wait for xenstore (2) failed: 0x102 <- the probe waited (already a W)
+//   E XcStoreRead: IOCTL_XENIFACE_STORE_READ failed: 0x5        <- identical text, still no key
+//   E libxenvchan_client_init: failed to read '<path>/ring-ref' from store: 0x5  <- key AND status
+//   E libvchan_client_init: libxenvchan_client_init(10858, <path>) failed        <- no status
+// The last restates the one above it with LESS detail; the second XcStoreRead is that line's own
+// inner report; the first is an EXPECTED probe miss at ERROR while the very next line says the probe
+// is waiting. Every distinct text fits in one line.
+//
+// WHY THIS NEEDS NO DETECTOR, which is what separates it from the five refusals recorded in the
+// branch below. Those proposed deciding the outcome was ORDINARY and then being QUIET, and that
+// refusal stands: 0x5 means both "no such node" and "refused", so the decision would rest on an
+// absence. THIS DECIDES NOTHING ABOUT THE OUTCOME. The connect failed, it is still reported at
+// ERROR, on every path, with every fact. Only the restating stops.
+//
+// NOTHING IS DESTROYED, the same contract as the quiet branch: every DISTINCT held text goes into
+// the single ERROR line with its repeat count, and then every held record is replayed at DEBUG, so
+// raising LogLevel reproduces the library's own sequence verbatim. The four failure exits of
+// libxenvchan_client_init that log NOTHING are covered too, because this line is emitted from the
+// FAILURE and names the domain and port even when the libraries said nothing - today those paths
+// are reported only by the single line this replaces.
+static void XifHoldReleaseCollapsed(int domain, int port)
+{
+    WCHAR line[2048];
+    WCHAR part[1200];
+    ULONG i, j, reps;
+    ULONG omitted = 0;
+    BOOL seen;
+
+    StringCbPrintfW(line, sizeof(line),
+                    L"QGAVCHANFAIL libvchan_client_init(%d, %d) failed - one report for %lu library record(s):",
+                    domain, port, g_XifHoldCount);
+    for (i = 0; i < g_XifHoldCount; i++)
+    {
+        seen = FALSE;
+        for (j = 0; j < i; j++)
+        {
+            if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
+            {
+                seen = TRUE;
+                break;
+            }
+        }
+        if (seen)
+            continue;   // already in the line; repeats are counted on the first occurrence
+
+        reps = 0;
+        for (j = i; j < g_XifHoldCount; j++)
+        {
+            if (0 == wcscmp(g_XifHold[j].text, g_XifHold[i].text))
+                reps++;
+        }
+        if (reps > 1)
+            StringCbPrintfW(part, sizeof(part), L" | %s (x%lu)", g_XifHold[i].text, reps);
+        else
+            StringCbPrintfW(part, sizeof(part), L" | %s", g_XifHold[i].text);
+        // TRUNCATION IS NEVER SILENT. StringCbCatW truncates and returns
+        // STRSAFE_E_INSUFFICIENT_BUFFER, and ignoring that would drop a fact from the one line that
+        // is now the whole report - the exact loss this change exists to avoid. On overflow the
+        // remaining DISTINCT texts are counted and named as omitted, and they are all still
+        // replayed at DEBUG below, so nothing is unrecoverable.
+        if (FAILED(StringCbCatW(line, sizeof(line), part)))
+        {
+            omitted++;
+            continue;
+        }
+    }
+    if (omitted)
+    {
+        WCHAR tail[128];
+        StringCbPrintfW(tail, sizeof(tail), L" | ...%lu more distinct record(s) did not fit - see the DEBUG replay",
+                        omitted);
+        // If even this does not fit the line is already at its bound; the DEBUG replay still carries
+        // every record, and g_XifHoldLost covers anything the hold itself could not take.
+        (void)StringCbCatW(line, sizeof(line), tail);
+    }
+    if (g_XifHoldCount == 0)
+        (void)StringCbCatW(line, sizeof(line), L" (the libraries logged nothing at all)");
+
+    // The same call shape as the replay: _LogFormat is printf-style and `line` is ALREADY formatted,
+    // so it is an ARGUMENT to L"%s" and never the format itself.
+    _LogFormat(LOG_LEVEL_ERROR, FALSE, "InitVchan", L"%s", line);
+
+    // ...then the library's own sequence at DEBUG, which also clears the hold and its counters.
+    XifHoldRelease(TRUE);
+}
+
 /**
  * @brief Create data vchan connection to the remote peer. Send MSG_HELLO if acting as server.
  * @param domain Remote vchan domain.
@@ -1018,20 +1113,21 @@ libvchan_t *InitVchan(
         }
         else
         {
-            // A FAILED CONNECT STAYS EXACTLY AS LOUD AS TODAY, deliberately.
+            // A FAILED CONNECT IS STILL REPORTED AT ERROR - as ONE line, not four.
             //
-            // The RCA this implements proposed classifying a departed peer and logging it once at
-            // INFO, behind two detectors. Jev refused both halves: ship_detector_b 0.16 (it needs
-            // a re-read through xencontrol, and NOTHING in core-agent includes xencontrol.h or
-            // links it - the wrapper links exactly libvchan.lib and windows-utils.lib - in a file
-            // that cannot be compiled on the dev host, on the path of every qrexec call into the
-            // guest), and detector_a_alone_sufficient 0.12, because A's verdict rests partly on
-            // which functions did NOT appear, and an absence is exactly what the design rule
-            // "quiet requires two agreeing POSITIVE detections" forbids as a basis for silence.
-            //
-            // So the four-errors-per-departed-peer P2 is NOT fixed by this commit and is not
-            // pretended to be. What is fixed is the successful-connect case above.
-            XifHoldRelease(FALSE);
+            // WHAT IS STILL REFUSED, and why this is not it. The RCA behind the hold proposed
+            // classifying a departed peer and logging it once at INFO, behind two detectors. Jev
+            // refused both halves: ship_detector_b 0.16 (it needs a re-read through xencontrol, and
+            // NOTHING in core-agent includes xencontrol.h or links it - the wrapper links exactly
+            // libvchan.lib and windows-utils.lib - in a file that cannot be compiled on the dev
+            // host, on the path of every qrexec call into the guest), and
+            // detector_a_alone_sufficient 0.12, because A's verdict rests partly on which functions
+            // did NOT appear, and an absence is exactly what the design rule "quiet requires two
+            // agreeing POSITIVE detections" forbids as a basis for silence. Two later patches that
+            // demoted these lines were refused three more times and retracted the same day.
+            // ALL FIVE REFUSALS WERE OF BEING QUIET. None of them is in force here: the failure is
+            // reported at ERROR with every distinct fact, and the level of nothing is lowered.
+            XifHoldReleaseCollapsed(domain, port);
         }
     }
 
