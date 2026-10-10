@@ -1211,10 +1211,11 @@ static DWORD WatchForEvents(HANDLE stopEvent)
                 else
                 {
                     // Not retried this boot: nothing else writes /qubes-tools/*, so dom0 never
-                    // sees qrexec=1 for this guest. Name the consequence; GetLastError() after
+                    // sees qrexec=1 for this guest: the tools' presence is advertised by that helper
+                    // alone. Name the consequence; GetLastError() after
                     // the helper's own cleanup is not the cause, `status` is.
                     win_perror2(status, "Failed to create advertise-tools process");
-                    LogError("tools presence NOT advertised this boot: dom0 will not see /qubes-tools/qrexec=1 (console session id %lu)",
+                    LogError("tools not reported to dom0 this boot (console session %lu), /qubes-tools/qrexec=1 stays unset",
                         WTSGetActiveConsoleSessionId());
                 }
                 continue;
@@ -1717,12 +1718,13 @@ int wmain(int argc, WCHAR* argv[])
     // (the install launch; post-install qrexec checks ~30 s after a boot). qrexec-wrapper gives the
     // service payload it starts the full mask back, so user work is not confined to this CPU.
     {
+        // Every wrapper this process starts inherits the pin; the line says only what this process did.
         DWORD_PTR procMask = 0, sysMask = 0;
         if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && sysMask)
         {
             DWORD_PTR one = sysMask & (~sysMask + 1); // the lowest CPU the system has
             if (SetProcessAffinityMask(GetCurrentProcess(), one))
-                LogInfo("QREXECPIN qrexec pinned to CPU mask 0x%Ix (system 0x%Ix); wrappers inherit it", one, sysMask);
+                LogInfo("QREXECPIN qrexec pinned to CPU mask 0x%Ix (system 0x%Ix)", one, sysMask);
             else
                 LogWarning("QREXECPIN could not pin qrexec to one CPU (error 0x%x) - running UNPINNED", GetLastError());
         }

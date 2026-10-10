@@ -302,10 +302,9 @@ DWORD StartChild(
                 // real local account (qvm-prefs default_user), so exec.c's LogonUser("user",...)
                 // failed. The correct fix for interactive services is in CreatePipedProcessAsUser
                 // (reuse the logged-on console token regardless of the requested name); log loudly
-                // here so a residual run-as failure is visible instead of silently becoming SYSTEM.
-                LogWarning("run-as user '%s' failed (0x%x) - degrading this service to SYSTEM "
-                    "(anomaly on a logged-on guest; the guest's real account may differ from the "
-                    "requested name)", userName, status);
+                // here so a residual run-as failure is visible instead of silently becoming SYSTEM: an
+                // anomaly on a logged-on guest, whose real account may differ from the requested name.
+                LogWarning("run-as user '%s' failed (0x%x), running this service as SYSTEM instead", userName, status);
                 status = CreateNormalProcessAsCurrentUser(
                     commandLine,
                     &child->Process);
@@ -1788,7 +1787,7 @@ cleanup:
         else if (g_exitReason == EXIT_REASON_PEER_CLOSED || g_exitReason == EXIT_REASON_CHILD_DRAINED)
             // Expected: the loop left on the ordinary end, which does not wait for the pumps. The
             // peer has what it asked for and the state is reclaimed by the process exit.
-            LogDebug("an output pump is still running at exit - %s; its state is left to the process exit",
+            LogDebug("an output pump is still running at exit - %s (ordinary end)",
                      ExitReasonName(g_exitReason));
         else if (g_exitReason == EXIT_REASON_DRAIN_EXPIRED)
             // Already reported above as a TRUNCATED transfer; saying it twice buries the first one.

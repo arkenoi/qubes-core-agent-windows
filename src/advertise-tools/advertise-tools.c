@@ -246,8 +246,9 @@ static void WaitForUserLogon(OUT char **userName)
     if (!registered)
     {
         // Fallback is an anomaly, not a mode: session notifications exist on every supported
-        // guest (wait-for-logon.c relies on them). Say so loudly rather than absorb it.
-        LogError("session change notification unavailable - falling back to polling every %lu ms; diagnose this",
+        // guest (wait-for-logon.c relies on them). Say so loudly rather than absorb it: falling back to
+        // polling is a condition to diagnose, never a mode to live in.
+        LogError("session change notification unavailable, polling every %lu ms instead",
             (ULONG)LOGON_WAIT_FALLBACK_POLL_MS);
     }
 
@@ -335,12 +336,14 @@ int wmain(int argc, WCHAR *argv[])
     // wait: a QdbDaemon restart during a slow logon left a dead pipe handle, every QdbWrite
     // below failed, and the guest stayed unadvertised for the boot. The parent (qrexec-agent)
     // already waited for qubesdb before launching us, so a failure here means qubesdb WAS up
-    // and is now gone - a component loss, logged as such.
+    // and is now gone - a component loss, logged as such. That cause (reachable when
+    // qrexec-agent launched us, not now) is this comment's; the line states what this
+    // process saw and what dom0 will miss.
     qdb = qdb_open(NULL);
     if (!qdb)
     {
         win_perror("qdb_open");
-        LogError("qubesdb was reachable when qrexec-agent launched us and is not now; tools presence NOT advertised, dom0 will not see /qubes-tools/qrexec=1");
+        LogError("qubesdb unreachable after the logon wait, dom0 is not told the tools are present (/qubes-tools/qrexec=1 unset)");
         goto cleanup;
     }
 
