@@ -355,11 +355,9 @@ static DWORD ParseUtf8Command(IN const char* commandUtf8, OUT WCHAR** userName,
         *runInteractively = FALSE;
     }
 
-    if (!wcscmp(*userName, L"SYSTEM") || !wcscmp(*userName, L"root"))
-    {
-        free(*userName);
-        *userName = NULL;
-    }
+    // The requested account is handed on as named: StartChild maps SYSTEM/root to this service's own token
+    // for every caller (NormalizeUserName). A copy of that mapping here, on this path only, is how the
+    // qrexec-client-vm path came to hand "SYSTEM" to LogonUser (RELAYLOGONSYSTEM).
 
     *commandLine = _wcsdup(separator);
 
@@ -700,10 +698,35 @@ BOOL VchanSendHello(
 }
 
 /**
+ * @brief The account the child runs as, from the account a request names.
+ *        "SYSTEM" and "root" (any case: Windows resolves account names case-insensitively, so "system"
+ *        can never name a different account) are this service's own account - LocalSystem, and dom0's
+ *        Linux-side name for it - which no LogonUser can satisfy. For them the child runs on this
+ *        service's own token, which qrexec-wrapper takes as the literal "(null)" user. Every other name,
+ *        including an empty one, is passed on verbatim and takes the wrapper's run-as path unchanged.
+ *        Applied in StartChild, the one place both the dom0-originated exec path and the guest-originated
+ *        qrexec-client-vm path reach, so they agree by construction. RELAYLOGONSYSTEM: the mapping used to
+ *        live in ParseUtf8Command, on the dom0 path only, and the client-vm path handed "SYSTEM" to
+ *        LogonUser (0x52e), so the dom0 toast relay never started.
+ * @param requested The account the request names, or NULL for this service's own token.
+ * @return NULL for this service's own token, otherwise requested itself.
+ */
+static PCWSTR NormalizeUserName(IN PCWSTR requested)
+{
+    if (requested && (!_wcsicmp(requested, L"SYSTEM") || !_wcsicmp(requested, L"root")))
+    {
+        LogInfo("user '%s' is this service's own account: no logon, the child runs on the service's token", requested);
+        return NULL;
+    }
+    return requested;
+}
+
+/**
  * @brief Start qrexec-wrapper process that will handle data vchan and child process I/O.
  * @param domain Data vchan domain.
  * @param port Data vchan port.
- * @param userName User name for the local executable.
+ * @param userName The account the request names for the local executable; SYSTEM/root mean this
+ *                 service's own token (NormalizeUserName).
  * @param commandLine Local executable to connect to data vchan.
  * @param isServer Determines whether qrexec-wrapper should act as a vchan server.
  * @param piped Determines whether the local executable's I/O should be connected to the data vchan.
@@ -713,6 +736,7 @@ BOOL VchanSendHello(
 static DWORD StartChild(int domain, int port, PWSTR userName, PWSTR commandLine, BOOL isServer, BOOL piped, BOOL interactive)
 {
     PWSTR command = malloc(MAX_PATH_LONG * sizeof(WCHAR));
+    PCWSTR childUser;
     int flags = 0;
     HANDLE wrapper;
     DWORD status;
@@ -730,6 +754,9 @@ static DWORD StartChild(int domain, int port, PWSTR userName, PWSTR commandLine,
     if (!command)
         return ERROR_OUTOFMEMORY;
 
+    // every caller - dom0's exec path and the guest's qrexec-client-vm path - resolves the account here
+    childUser = NormalizeUserName(userName);
+
     if (isServer)    flags |= 0x01;
     if (piped)       flags |= 0x02;
     if (interactive) flags |= 0x04;
@@ -737,12 +764,12 @@ static DWORD StartChild(int domain, int port, PWSTR userName, PWSTR commandLine,
     StringCchPrintf(command, MAX_PATH_LONG, L"qrexec-wrapper.exe %d%c%d%c%s%c%d%c%s",
         domain, QUBES_ARGUMENT_SEPARATOR,
         port, QUBES_ARGUMENT_SEPARATOR,
-        userName, QUBES_ARGUMENT_SEPARATOR,
+        childUser, QUBES_ARGUMENT_SEPARATOR,
         flags, QUBES_ARGUMENT_SEPARATOR,
         commandLine);
 
     LogDebug("domain %d, port %d, user '%s', isServer %d, piped %d, interactive %d, cmd '%s', final command '%s'",
-        domain, port, userName, isServer, piped, interactive, commandLine, command);
+        domain, port, childUser, isServer, piped, interactive, commandLine, command);
     // wrapper will run as current user (SYSTEM, we're a service)
     status = CreateNormalProcessAsCurrentUser(command, &wrapper);
     if (status == ERROR_SUCCESS)
