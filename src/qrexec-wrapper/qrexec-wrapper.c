@@ -249,11 +249,22 @@ static CHAR g_FailureText[512] = { 0 };
 // still looking at the screen.
 #define QW_LOGON_WAIT_MS (90u * 1000u)
 
-// TRUE as soon as a user is logged on at the console, and says WHO. Polls only - no credential is
+// NOT THE PV CONSOLE. In this project "console" means the Xen PV console - a DIAGNOSTIC channel
+// reached through admin.vm.Console, served by dom0, and deliberately usable when nothing in the
+// guest is healthy. It must never depend on a user being logged in, and nothing here touches it:
+// that call goes to dom0, never to this wrapper. What this function waits for is the WINDOWS
+// notion - the interactive session returned by WTSGetActiveConsoleSessionId, i.e. somebody logged
+// in at the desktop. The two share a word and nothing else.
+//
+// This wait is reached ONLY for a service asked to run AS A USER. A SYSTEM-context service -
+// qubes.VMShell, which is what the diagnostic paths use - never enters this branch and is not
+// delayed or failed by it.
+//
+// TRUE as soon as a user is logged on interactively, and says WHO. Polls only - no credential is
 // touched, so it cannot contribute to an account lockout the way a retried LogonUser would.
 // The name matters as much as the fact: the only way to run something as the user is to reuse the
 // session that exists, so the caller must address that account and not the one it was asked for.
-static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUser) PWSTR userOut, _In_ DWORD cchUser)
+static BOOL QwWaitForInteractiveLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUser) PWSTR userOut, _In_ DWORD cchUser)
 {
     const DWORD step = 1000;
     DWORD waited = 0;
@@ -279,7 +290,7 @@ static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUser) 
                 WTSFreeMemory(wtsName);
             }
             if (waited > 0)
-                LogInfo("console logon appeared after %lu ms (user '%s')", waited, userOut);
+                LogInfo("interactive logon appeared after %lu ms (user '%s')", waited, userOut);
             return TRUE;
         }
 
@@ -287,7 +298,7 @@ static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUser) 
             return FALSE;
 
         if (waited % 10000 == 0)
-            LogDebug("waiting for console logon (%lu of %lu ms)", waited, timeoutMs);
+            LogDebug("waiting for interactive logon (%lu of %lu ms)", waited, timeoutMs);
 
         Sleep(step);
         waited += step;
@@ -333,19 +344,19 @@ DWORD StartChild(
     // LogonUser with credentials that have already been refused, and a failed logon counts toward
     // ACCOUNT LOCKOUT - on these guests autologon is what recovers a lockout, so provoking one
     // would take the qube out altogether. Polling the console session touches no credential.
-    WCHAR consoleUser[UNLEN + 1] = { 0 };
+    WCHAR sessionUser[UNLEN + 1] = { 0 };
     PWSTR launchUser = userName;   // userName is `const PWSTR`: the POINTER is const
 
     if (userName)
     {
-        if (!QwWaitForConsoleLogon(QW_LOGON_WAIT_MS, consoleUser, RTL_NUMBER_OF(consoleUser)))
+        if (!QwWaitForInteractiveLogon(QW_LOGON_WAIT_MS, sessionUser, RTL_NUMBER_OF(sessionUser)))
         {
             StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
                              "qrexec-wrapper: no user is logged on in this qube after %u s, so the "
                              "service '%S' could not be started as '%S'. On a qube that was just "
                              "started this means the request arrived before logon completed.\r\n",
                              QW_LOGON_WAIT_MS / 1000, commandLine, userName);
-            LogError("no console logon after %u ms; service '%s' as '%s' is not started",
+            LogError("no interactive logon after %u ms; service '%s' as '%s' is not started",
                      QW_LOGON_WAIT_MS, commandLine, userName);
             return ERROR_LOGON_FAILURE;
         }
@@ -357,21 +368,21 @@ DWORD StartChild(
         // guest's account: the field case (GWeck, 2026-09-10) is a guest whose only account is
         // named something else entirely, where every launch took the dead path. Say so once, out
         // loud, and use the account that is actually logged on.
-        if (!consoleUser[0])
+        if (!sessionUser[0])
         {
             StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
                              "qrexec-wrapper: a user is logged on in this qube but the account name "
                              "could not be read, so the service '%S' could not be started.\r\n",
                              commandLine);
-            LogError("console session has no readable user name; service '%s' is not started", commandLine);
+            LogError("the interactive session has no readable user name; service '%s' is not started", commandLine);
             return ERROR_LOGON_FAILURE;
         }
-        if (wcscmp(consoleUser, userName) != 0)
+        if (wcscmp(sessionUser, userName) != 0)
         {
-            LogWarning("requested user '%s' is not the account logged on at the console ('%s') - "
+            LogWarning("requested user '%s' is not the account logged on interactively ('%s') - "
                        "running in the session that exists; dom0's default_user does not match this "
-                       "guest's account", userName, consoleUser);
-            launchUser = consoleUser;
+                       "guest's account", userName, sessionUser);
+            launchUser = sessionUser;
         }
     }
 
