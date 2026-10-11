@@ -358,6 +358,7 @@ Function SweepStoreApps()
     # manifest and so contribute nothing.
     $apps = @()
     $seenAumid = @{}
+    $script:QwtHiddenApps = 0
     try {
         foreach ($a in @(Get-StartApps -ErrorAction Stop)) {
             if ($a.AppID -and ($a.AppID -match '!') -and -not $seenAumid.ContainsKey($a.AppID)) {
@@ -369,10 +370,40 @@ Function SweepStoreApps()
 
     try {
         foreach ($pkg in @(Get-AppxPackage -ErrorAction Stop)) {
-            $mf = $null
-            try { $mf = Get-AppxPackageManifest $pkg -ErrorAction Stop } catch { continue }
-            foreach ($app in @($mf.Package.Applications.Application)) {
+            # TWO WAYS TO THE MANIFEST, because the cmdlet cannot be relied on. Probed on
+            # win11-app 2026-10-11: Get-AppxPackageManifest returned an object whose
+            # .Package.Applications.Application is NULL - the Id came back empty and the element
+            # had no attributes at all - while reading AppxManifest.xml straight out of the
+            # package's InstallLocation gave `COUNT 1, ID [App], exe=[CalculatorApp.exe]`, i.e.
+            # the AUMID Microsoft.WindowsCalculator_8wekyb3d8bbwe!App. An empty Id makes the loop
+            # below skip the app, so relying on the cmdlet alone would have silently dropped
+            # Calculator - the very app this change exists to surface.
+            $appNodes = @()
+            try {
+                $mf = Get-AppxPackageManifest $pkg -ErrorAction Stop
+                $appNodes = @($mf.Package.Applications.Application) | Where-Object { $_ -and $_.Id }
+            } catch { }
+            if ($appNodes.Count -eq 0 -and $pkg.InstallLocation) {
+                try {
+                    $mx = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+                    if (Test-Path -LiteralPath $mx) {
+                        $x = [xml](Get-Content -LiteralPath $mx -Raw -ErrorAction Stop)
+                        $appNodes = @($x.Package.Applications.Application) | Where-Object { $_ -and $_.Id }
+                    }
+                } catch { LogDebug "manifest of '$($pkg.PackageFamilyName)' unreadable: $($_.Exception.Message)" }
+            }
+            foreach ($app in $appNodes) {
                 if (-not $app.Id) { continue }
+                # THE APP'S OWN DECLARATION that it is not a listed app. A UWP manifest marks a
+                # background broker, shell host or framework surface with AppListEntry="none", and
+                # Windows itself uses exactly this to keep it out of the All-apps list. Honouring
+                # it is NOT the "silently dropped most of the apps" failure rejected elsewhere in
+                # this file: that was OUR choice to hide real apps, this is the app saying it is
+                # not one. MEASURED on win11-app: 106 packages yield 196 application entries, of
+                # which 163 are marked none - reporting all 196 would bury the 33 real apps.
+                # The count is logged so the exclusion is never silent.
+                $ale = $app.VisualElements.AppListEntry
+                if ($ale -and ($ale -eq 'none')) { $script:QwtHiddenApps++; continue }
                 $aum = $pkg.PackageFamilyName + '!' + $app.Id
                 if ($seenAumid.ContainsKey($aum)) { continue }
                 $seenAumid[$aum] = $true
@@ -384,7 +415,7 @@ Function SweepStoreApps()
             }
         }
     } catch { LogWarning "installed-package enumeration failed: $($_.Exception.Message)" }
-    LogDebug "store apps to report: $($apps.Count)"
+    LogInfo "store apps: $($apps.Count) to report, $script:QwtHiddenApps marked AppListEntry=none by their own manifest"
 
     foreach ($a in $apps) {
         try {
