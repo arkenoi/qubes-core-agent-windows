@@ -25,7 +25,10 @@
 
 #include "qrexec-wrapper.h"
 #include <stdlib.h>
+#include <string.h>
 #include <shlwapi.h>
+#include <wtsapi32.h>
+#pragma comment(lib, "wtsapi32.lib")
 #include <assert.h>
 #include <strsafe.h>
 
@@ -233,6 +236,49 @@ DWORD CreateChildPipes(
     return ERROR_SUCCESS;
 }
 
+// Text handed to the CALLER's stderr when a service cannot be started at all. Filled in by
+// StartChild on a failure the caller would otherwise see only as a truncated number, and flushed in
+// the cleanup path below, after the hello and before the exit code - the only ordering the protocol
+// allows. Static because the failure happens before any child, so there is nothing else to carry it.
+static CHAR g_FailureText[512] = { 0 };
+
+// How long to wait for the interactive session before giving up on a user-context service. The
+// qube boot itself is ~60 s on these guests and the session followed the request by ~20 s in the
+// measured case, so this is sized to cover a slow boot and still return while a person is plausibly
+// still looking at the screen.
+#define QW_LOGON_WAIT_MS (90u * 1000u)
+
+// TRUE as soon as a user is logged on at the console. Polls only - no credential is touched, so it
+// cannot contribute to an account lockout the way a retried LogonUser would.
+static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs)
+{
+    const DWORD step = 1000;
+    DWORD waited = 0;
+
+    for (;;)
+    {
+        DWORD sessionId = WTSGetActiveConsoleSessionId();
+        HANDLE token = NULL;
+
+        if (sessionId != 0xFFFFFFFF && WTSQueryUserToken(sessionId, &token))
+        {
+            CloseHandle(token);
+            if (waited > 0)
+                LogInfo("console logon appeared after %lu ms", waited);
+            return TRUE;
+        }
+
+        if (waited >= timeoutMs)
+            return FALSE;
+
+        if (waited % 10000 == 0)
+            LogDebug("waiting for console logon (%lu of %lu ms)", waited, timeoutMs);
+
+        Sleep(step);
+        waited += step;
+    }
+}
+
 /**
 * @brief Create the child process that's optionally piped with data peer's vchan for i/o exchange.
 * @param child Child state.
@@ -256,6 +302,34 @@ DWORD StartChild(
     assert(commandLine);
 
     LogDebug("user '%s', cmd '%s', interactive %d, piped %d", userName, commandLine, interactive, piped);
+
+    // A USER-CONTEXT SERVICE CANNOT START BEFORE THE USER HAS LOGGED ON, and on a cold qube the
+    // request arrives first. MEASURED on win11-app 2026-10-11, the owner starting Calculator from
+    // dom0's application menu on a halted qube:
+    //     GetLoggedOnUserToken: no user is logged on
+    //     CreatePipedProcessAsUser: LogonUser failed with error 0x52e   (ERROR_LOGON_FAILURE)
+    //     VchanSendExitCode: Sent exit code 1326
+    // dom0 reported "command failed with code: 46" - 1326 & 0xff - and the user saw the qube start
+    // and nothing else. The session is not far away: on that same boot notifhost --relay ran as
+    // user 'user' 20 s later. qubes-rpc-services\start-app.ps1 already waits for the session, in
+    // the same spirit and with the same bound, but it never runs because this fails ahead of it.
+    //
+    // WAIT FOR THE SESSION, DO NOT RETRY THE LOGON. Retrying CreatePipedProcessAsUser would hammer
+    // LogonUser with credentials that have already been refused, and a failed logon counts toward
+    // ACCOUNT LOCKOUT - on these guests autologon is what recovers a lockout, so provoking one
+    // would take the qube out altogether. Polling the console session touches no credential.
+    if (userName && !QwWaitForConsoleLogon(QW_LOGON_WAIT_MS))
+    {
+        StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
+                         "qrexec-wrapper: no user is logged on in this qube after %u s, so the "
+                         "service '%S' could not be started as '%S'. On a qube that was just "
+                         "started this means the request arrived before logon completed.\r\n",
+                         QW_LOGON_WAIT_MS / 1000, commandLine, userName);
+        LogError("no console logon after %u ms - refusing to attempt a logon that would only fail "
+                 "(and count toward lockout); service '%s' as '%s' is not started",
+                 QW_LOGON_WAIT_MS, commandLine, userName);
+        return ERROR_LOGON_FAILURE;
+    }
 
     // if userName is NULL we run the process on behalf of the current user.
     if (userName)
@@ -1742,6 +1816,12 @@ cleanup:
                     // flowed (a console-control stop, an i/o error) a second hello would be a protocol error
                     if (!child->HelloSent)
                         VchanSendHello(child->Vchan);
+                    // SAY WHY, in words, before the number. A caller gets the exit code truncated to
+                    // 8 bits (1326 arrives as 46), so a bare status tells a user nothing at all -
+                    // which is exactly how a failed app-menu start became silent.
+                    if (g_FailureText[0])
+                        VchanSendData(child, (const BYTE *)g_FailureText,
+                                      (DWORD)strlen(g_FailureText), PTYPE_STDERR);
                     VchanSendExitCode(child, status);
                 }
             }
