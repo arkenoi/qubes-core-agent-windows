@@ -29,6 +29,8 @@
 #include <shlwapi.h>
 #include <wtsapi32.h>
 #include <lmcons.h>
+#include <userenv.h>
+#pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "wtsapi32.lib")
 #include <assert.h>
 #include <strsafe.h>
@@ -249,6 +251,100 @@ static CHAR g_FailureText[512] = { 0 };
 // still looking at the screen.
 #define QW_LOGON_WAIT_MS (90u * 1000u)
 
+// LAUNCH ON THE CONSOLE SESSION'S OWN TOKEN. No password, no name matching, no LogonUser.
+//
+// WHY THIS EXISTS RATHER THAN CreatePipedProcessAsUser. That helper decides between two paths with
+//     if (!userToken || wcscmp(loggedUserName, userName))
+// and the second path is dead code on this product: it calls LogonUser with a password, and the
+// password the agent used to pass was a compile-time L"userpass" that never matched the account our
+// installer creates - every cold app-menu start died there with 0x52e, reported to dom0 as a
+// truncated "code 46" and nothing else (2026-10-11). Worse, even with a CORRECT password it cannot
+// work: the helper returns ERROR_NOT_SUPPORTED immediately for a user who is not already logged on,
+// because granting a fresh logon session access to the interactive desktop and window station was
+// never implemented - the call is commented out upstream. A token is not a desktop.
+//
+// Waiting for the session and passing the real console account name made that branch unreachable,
+// which is not the same as it being gone: a token lookup that fails, or any future divergence in
+// how the two sides spell a user name, drops straight back into it. So take the token directly.
+// The sequence mirrors what the helper does on its WORKING path and omits only the dead one.
+static DWORD QwCreateProcessAsSessionUser(
+    _Inout_ PWSTR commandLine,          // CreateProcess* may modify it
+    _In_ BOOL interactive,
+    _In_ HANDLE pipeStdin,
+    _In_ HANDLE pipeStdout,
+    _In_ HANDLE pipeStderr,
+    _Out_ HANDLE *process
+    )
+{
+    DWORD status = ERROR_SUCCESS, sessionId;
+    HANDLE token = NULL, primary = NULL;
+    LPVOID environment = NULL;
+    STARTUPINFO si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    BOOL inheritHandles = FALSE;
+
+    *process = NULL;
+    sessionId = WTSGetActiveConsoleSessionId();
+    if (sessionId == 0xFFFFFFFF)
+        return win_perror2(ERROR_NO_SUCH_LOGON_SESSION, "no active console session");
+    if (!WTSQueryUserToken(sessionId, &token))
+        return win_perror("WTSQueryUserToken");
+
+    if (!DuplicateTokenEx(token, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &primary))
+    {
+        status = win_perror("DuplicateTokenEx");
+        goto cleanup;
+    }
+    // A NON-INTERACTIVE service runs in OUR session, not the console one - the helper does
+    // `consoleSessionId = currentSessionId`, and copying that line wrongly would have put every
+    // non-interactive service on the console session instead.
+    if (!interactive)
+    {
+        DWORD mySession = 0;
+        if (ProcessIdToSessionId(GetCurrentProcessId(), &mySession))
+            sessionId = mySession;
+    }
+    if (!SetTokenInformation(primary, TokenSessionId, &sessionId, sizeof(sessionId)))
+    {
+        status = win_perror("SetTokenInformation(session)");
+        goto cleanup;
+    }
+    if (!CreateEnvironmentBlock(&environment, primary, TRUE))
+    {
+        status = win_perror("CreateEnvironmentBlock");
+        goto cleanup;
+    }
+
+    si.cb = sizeof(si);
+    si.lpDesktop = TEXT("Winsta0\\Default");
+    if (pipeStdin != INVALID_HANDLE_VALUE && pipeStdout != INVALID_HANDLE_VALUE && pipeStderr != INVALID_HANDLE_VALUE)
+    {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = pipeStdin;
+        si.hStdOutput = pipeStdout;
+        si.hStdError = pipeStderr;
+        inheritHandles = TRUE;
+    }
+
+    if (!CreateProcessAsUser(primary, NULL, commandLine, NULL, NULL, inheritHandles,
+                             NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                             environment, NULL, &si, &pi))
+    {
+        status = win_perror("CreateProcessAsUser");
+        goto cleanup;
+    }
+    LogDebug("started on the console session token, pid %lu", pi.dwProcessId);
+    *process = pi.hProcess;
+    status = ERROR_SUCCESS;
+
+cleanup:
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (environment) DestroyEnvironmentBlock(environment);
+    if (primary) CloseHandle(primary);
+    if (token) CloseHandle(token);
+    return status;
+}
+
 // NOT THE PV CONSOLE. In this project "console" means the Xen PV console - a DIAGNOSTIC channel
 // reached through admin.vm.Console, served by dom0, and deliberately usable when nothing in the
 // guest is healthy. It must never depend on a user being logged in, and nothing here touches it:
@@ -401,27 +497,26 @@ DWORD StartChild(
 
     if (launchUser)
     {
+        // THE CONSOLE SESSION'S TOKEN, DIRECTLY. Neither call goes through
+        // CreatePipedProcessAsUser/CreateNormalProcessAsUser any more: those choose between a
+        // working path and a dead LogonUser one, and keeping them merely meant the dead path was
+        // unreachable rather than gone. See QwCreateProcessAsSessionUser.
         if (piped)
         {
-            status = CreatePipedProcessAsUser(
-                launchUser,
-                NULL, // NO PASSWORD. The only usable path reuses the console token, which is
-                      // why the wait above runs first; the LogonUser branch this used to feed
-                      // could never succeed (see the note on the wait).
+            status = QwCreateProcessAsSessionUser(
                 commandLine,
                 interactive,
-                child->Stdin.ReadEndpoint, // child will use stdin for reading and stdout/stderr for writing
+                child->Stdin.ReadEndpoint, // child reads stdin, writes stdout/stderr
                 child->Stdout.WriteEndpoint,
                 child->Stderr.WriteEndpoint,
                 &child->Process);
         }
         else // piped
         {
-            status = CreateNormalProcessAsUser(
-                launchUser,
-                NULL, // no password - see the piped call above
+            status = QwCreateProcessAsSessionUser(
                 commandLine,
                 interactive,
+                INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE,
                 &child->Process);
 
             if (ERROR_SUCCESS != status)
@@ -434,7 +529,7 @@ DWORD StartChild(
                 // logged on and addresses THAT, so a mismatch no longer reaches here. What does reach
                 // here is a genuine failure to run as a real, logged-on user - and the honest answer to
                 // that is to fail and say so, not to run it with more privilege than was asked for.
-                win_perror2(status, "CreateNormalProcessAsUser");
+                win_perror2(status, "QwCreateProcessAsSessionUser");
                 StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
                                  "qrexec-wrapper: could not run '%S' as the logged-on user '%S' "
                                  "(error 0x%x). It was NOT run as SYSTEM instead.\r\n",
