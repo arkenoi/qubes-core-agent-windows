@@ -25,7 +25,10 @@
 #include <qrexec.h>
 
 // TODO: make configurable
-#define DEFAULT_USER_PASSWORD_UNICODE   L"userpass"
+// The compiled-in default password is GONE. It was L"userpass", it never matched the account
+// our installer creates, and even with the right password the only consumer returned
+// ERROR_NOT_SUPPORTED because granting a fresh logon session access to the interactive desktop
+// was never implemented. A user-context service now reuses the console session or fails saying so.
 
 #define VCHAN_BUFFER_SIZE 65536
 #define PIPE_BUFFER_SIZE 65536

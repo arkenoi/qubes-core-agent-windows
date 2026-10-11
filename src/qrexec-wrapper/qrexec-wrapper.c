@@ -28,6 +28,7 @@
 #include <string.h>
 #include <shlwapi.h>
 #include <wtsapi32.h>
+#include <lmcons.h>
 #pragma comment(lib, "wtsapi32.lib")
 #include <assert.h>
 #include <strsafe.h>
@@ -248,12 +249,17 @@ static CHAR g_FailureText[512] = { 0 };
 // still looking at the screen.
 #define QW_LOGON_WAIT_MS (90u * 1000u)
 
-// TRUE as soon as a user is logged on at the console. Polls only - no credential is touched, so it
-// cannot contribute to an account lockout the way a retried LogonUser would.
-static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs)
+// TRUE as soon as a user is logged on at the console, and says WHO. Polls only - no credential is
+// touched, so it cannot contribute to an account lockout the way a retried LogonUser would.
+// The name matters as much as the fact: the only way to run something as the user is to reuse the
+// session that exists, so the caller must address that account and not the one it was asked for.
+static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUser) PWSTR userOut, _In_ DWORD cchUser)
 {
     const DWORD step = 1000;
     DWORD waited = 0;
+
+    if (cchUser)
+        userOut[0] = L'\0';
 
     for (;;)
     {
@@ -262,9 +268,18 @@ static BOOL QwWaitForConsoleLogon(_In_ DWORD timeoutMs)
 
         if (sessionId != 0xFFFFFFFF && WTSQueryUserToken(sessionId, &token))
         {
+            PWSTR wtsName = NULL;
+            DWORD wtsLen = 0;
+
             CloseHandle(token);
+            if (WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSUserName, &wtsName, &wtsLen))
+            {
+                if (wtsName)
+                    StringCchCopy(userOut, cchUser, wtsName);
+                WTSFreeMemory(wtsName);
+            }
             if (waited > 0)
-                LogInfo("console logon appeared after %lu ms", waited);
+                LogInfo("console logon appeared after %lu ms (user '%s')", waited, userOut);
             return TRUE;
         }
 
@@ -318,22 +333,51 @@ DWORD StartChild(
     // LogonUser with credentials that have already been refused, and a failed logon counts toward
     // ACCOUNT LOCKOUT - on these guests autologon is what recovers a lockout, so provoking one
     // would take the qube out altogether. Polling the console session touches no credential.
-    if (userName && !QwWaitForConsoleLogon(QW_LOGON_WAIT_MS))
+    WCHAR consoleUser[UNLEN + 1] = { 0 };
+    PWSTR launchUser = userName;   // userName is `const PWSTR`: the POINTER is const
+
+    if (userName)
     {
-        StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
-                         "qrexec-wrapper: no user is logged on in this qube after %u s, so the "
-                         "service '%S' could not be started as '%S'. On a qube that was just "
-                         "started this means the request arrived before logon completed.\r\n",
-                         QW_LOGON_WAIT_MS / 1000, commandLine, userName);
-        LogError("no console logon after %u ms - refusing to attempt a logon that would only fail "
-                 "(and count toward lockout); service '%s' as '%s' is not started",
-                 QW_LOGON_WAIT_MS, commandLine, userName);
-        return ERROR_LOGON_FAILURE;
+        if (!QwWaitForConsoleLogon(QW_LOGON_WAIT_MS, consoleUser, RTL_NUMBER_OF(consoleUser)))
+        {
+            StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
+                             "qrexec-wrapper: no user is logged on in this qube after %u s, so the "
+                             "service '%S' could not be started as '%S'. On a qube that was just "
+                             "started this means the request arrived before logon completed.\r\n",
+                             QW_LOGON_WAIT_MS / 1000, commandLine, userName);
+            LogError("no console logon after %u ms; service '%s' as '%s' is not started",
+                     QW_LOGON_WAIT_MS, commandLine, userName);
+            return ERROR_LOGON_FAILURE;
+        }
+
+        // THE SESSION THAT EXISTS IS THE ONLY ONE WE CAN USE, so address it by its real account.
+        // The helper below reuses the console token when the requested name matches the logged-on
+        // one and otherwise calls LogonUser - a path that cannot work here and is now deleted (see
+        // the password note above). dom0 asks for its `default_user`, which is NOT always this
+        // guest's account: the field case (GWeck, 2026-09-10) is a guest whose only account is
+        // named something else entirely, where every launch took the dead path. Say so once, out
+        // loud, and use the account that is actually logged on.
+        if (!consoleUser[0])
+        {
+            StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
+                             "qrexec-wrapper: a user is logged on in this qube but the account name "
+                             "could not be read, so the service '%S' could not be started.\r\n",
+                             commandLine);
+            LogError("console session has no readable user name; service '%s' is not started", commandLine);
+            return ERROR_LOGON_FAILURE;
+        }
+        if (wcscmp(consoleUser, userName) != 0)
+        {
+            LogWarning("requested user '%s' is not the account logged on at the console ('%s') - "
+                       "running in the session that exists; dom0's default_user does not match this "
+                       "guest's account", userName, consoleUser);
+            launchUser = consoleUser;
+        }
     }
 
-    // if userName is NULL we run the process on behalf of the current user.
-    if (userName)
-        LogInfo("Running '%s' as user '%s'", commandLine, userName);
+    // if launchUser is NULL we run the process on behalf of the current user (SYSTEM).
+    if (launchUser)
+        LogInfo("Running '%s' as user '%s'", commandLine, launchUser);
     else
         LogInfo("Running '%s' as SYSTEM", commandLine);
 
@@ -344,13 +388,15 @@ DWORD StartChild(
             return win_perror2(status, "CreateChildPipes");
     }
 
-    if (userName)
+    if (launchUser)
     {
         if (piped)
         {
             status = CreatePipedProcessAsUser(
-                userName,
-                DEFAULT_USER_PASSWORD_UNICODE, // password will only be required if the requested user is not logged on
+                launchUser,
+                NULL, // NO PASSWORD. The only usable path reuses the console token, which is
+                      // why the wait above runs first; the LogonUser branch this used to feed
+                      // could never succeed (see the note on the wait).
                 commandLine,
                 interactive,
                 child->Stdin.ReadEndpoint, // child will use stdin for reading and stdout/stderr for writing
@@ -361,27 +407,29 @@ DWORD StartChild(
         else // piped
         {
             status = CreateNormalProcessAsUser(
-                userName,
-                DEFAULT_USER_PASSWORD_UNICODE,
+                launchUser,
+                NULL, // no password - see the piped call above
                 commandLine,
                 interactive,
                 &child->Process);
 
             if (ERROR_SUCCESS != status)
             {
+                // NO SILENT PROMOTION TO SYSTEM. This used to degrade to CreateNormalProcessAsCurrentUser,
+                // i.e. run as SYSTEM a service dom0 asked to run AS THE USER - a privilege change the
+                // caller never asked for and cannot see, justified by the name-mismatch case (GWeck,
+                // 2026-09-10: dom0's default_user not matching the guest's only account). That case is
+                // handled properly now, before the launch: the wait above resolves the account actually
+                // logged on and addresses THAT, so a mismatch no longer reaches here. What does reach
+                // here is a genuine failure to run as a real, logged-on user - and the honest answer to
+                // that is to fail and say so, not to run it with more privilege than was asked for.
                 win_perror2(status, "CreateNormalProcessAsUser");
-                // Run-as the requested user failed, so we degrade to SYSTEM. This is an ANOMALY on
-                // a logged-on guest, not a normal fallback: the usual cause is the GWeck field bug
-                // (2026-09-10) where dom0's default target user "user" does not match the guest's
-                // real local account (qvm-prefs default_user), so exec.c's LogonUser("user",...)
-                // failed. The correct fix for interactive services is in CreatePipedProcessAsUser
-                // (reuse the logged-on console token regardless of the requested name); log loudly
-                // here so a residual run-as failure is visible instead of silently becoming SYSTEM: an
-                // anomaly on a logged-on guest, whose real account may differ from the requested name.
-                LogWarning("run-as user '%s' failed (0x%x), running this service as SYSTEM instead", userName, status);
-                status = CreateNormalProcessAsCurrentUser(
-                    commandLine,
-                    &child->Process);
+                StringCchPrintfA(g_FailureText, RTL_NUMBER_OF(g_FailureText),
+                                 "qrexec-wrapper: could not run '%S' as the logged-on user '%S' "
+                                 "(error 0x%x). It was NOT run as SYSTEM instead.\r\n",
+                                 commandLine, launchUser, status);
+                LogError("run-as user '%s' failed (0x%x); refusing to run this service as SYSTEM instead",
+                         launchUser, status);
             }
         }
     }
