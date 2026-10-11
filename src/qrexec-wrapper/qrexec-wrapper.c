@@ -326,9 +326,22 @@ static DWORD QwCreateProcessAsSessionUser(
         inheritHandles = TRUE;
     }
 
+    // CREATE_NO_WINDOW IS NOT ENOUGH ON WINDOWS 11, and this is the "terminal blink" the owner
+    // sees on every qrexec call. A service command is `cmd.exe /c ...`; cmd is a console program,
+    // so Windows gives it a console, and on Win11 the DefTerm handoff re-hosts that console in
+    // WINDOWS TERMINAL - a real top-level window (class CASCADIA_HOSTING_WINDOW_CLASS) which the
+    // agent then maps, exactly as mgmt/harness/matrix.sh already records for the installer case.
+    // CREATE_NO_WINDOW asks for a console with no window; it does not stop the handoff.
+    //
+    // DETACHED_PROCESS asks for NO CONSOLE AT ALL, so there is nothing to hand off. It is only
+    // correct when the child's stdio comes from somewhere else - which is exactly the piped case,
+    // where STARTF_USESTDHANDLES supplies all three. Without pipes a console program would lose
+    // its stdio entirely, so that case keeps CREATE_NO_WINDOW.
+    // The two flags are mutually exclusive; passing both is an error.
+    DWORD creation = NORMAL_PRIORITY_CLASS | CREATE_UNICODE_ENVIRONMENT |
+                     (inheritHandles ? DETACHED_PROCESS : CREATE_NO_WINDOW);
     if (!CreateProcessAsUser(primary, NULL, commandLine, NULL, NULL, inheritHandles,
-                             NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                             environment, NULL, &si, &pi))
+                             creation, environment, NULL, &si, &pi))
     {
         status = win_perror("CreateProcessAsUser");
         goto cleanup;
