@@ -178,6 +178,23 @@ try {
 if (-not $target) { Fail "'$desktopBaseName' resolved to an empty target" }
 
 LogDebug "Starting $target"
-try { Start-Process -FilePath $target -ErrorAction Stop }
+# WHY 6 - A UWP APP HAS NO FILE TO START. Everything above assumes the AppMap value is a path
+# (a .lnk, or an .exe), because the scan only ever wrote .lnk paths. A modern Windows app -
+# Calculator, Photos, Terminal, the Store - has no .lnk anywhere: it exists only in AppsFolder
+# under its AUMID, so it could not be reported by the scan and could not be launched here.
+# MEASURED on win11-app 2026-10-11: the guest's Start Menu holds 41 shortcuts, every one a legacy
+# or admin tool, and none of them Calculator - while the package itself is installed and runnable
+# (STATUS Ok, USER user state=Installed). The owner's words: "there is no calculator entry in
+# start menu, to begin with".
+# The moniker is handed to explorer, which is what performs the activation; Start-Process on the
+# moniker itself is interpreted as a file path and fails.
+try {
+    if ($target -like 'shell:AppsFolder\*') {
+        LogDebug "AppsFolder activation: $target"
+        Start-Process -FilePath 'explorer.exe' -ArgumentList $target -ErrorAction Stop
+    } else {
+        Start-Process -FilePath $target -ErrorAction Stop
+    }
+}
 catch { Fail "could not start '$target': $($_.Exception.Message)" }
 exit 0

@@ -140,6 +140,19 @@ Function Get-QwtDesktopName($id)
     return $safe
 }
 
+# Pure. THE KEY THE APPMAP MUST BE WRITTEN UNDER, which is the id dom0 will hand back to
+# qubes.StartApp - the emitted desktop name without its .desktop suffix, NOT the raw id.
+# Emit-Entry sanitises an id ([^a-zA-Z0-9._-] -> '_') before printing it, while the AppMap was
+# written from the raw string, so the two disagreed for any name carrying a character outside that
+# class. A real example from the measured guest: "Windows PowerShell (x86).lnk" is reported to dom0
+# as `Windows_PowerShell__x86_` and was stored under `Windows_PowerShell_(x86)`, so launching it
+# answered "no AppMap entry" - the same silent dead menu entry this file already documents for the
+# RECOMMENDATION list (measured 2026-10-07). One derivation, used by every writer.
+Function Get-QwtAppMapKey($id)
+{
+    return ((Get-QwtDesktopName $id) -replace '\.desktop$', '')
+}
+
 # Pure. The key a DISPLAYED name is remembered under: what dom0 will actually receive, lower-cased.
 # Going through Get-QwtSafeValue is the point, not tidiness - two names are the same menu label iff
 # their keys match. Keying on the RAW name let two shortcuts emit one identical label while the
@@ -253,7 +266,7 @@ Function ProcessLink($pathObj, $basepath)
         # Store the hash-LNK mapping in the registry for easy retrieval by GetImageRGBA.
         Set-AppMap $targetHash $pathObj.FullName
         # Store also basename-LNK location for qubes.StartApp service
-        Set-AppMap $desktopFileName.Replace('.lnk', '') $pathObj.FullName
+        Set-AppMap (Get-QwtAppMapKey ($desktopFileName.Replace('.lnk', ''))) $pathObj.FullName
 
         LogDebug "$targetHash -> $targetPath"
 
@@ -303,8 +316,115 @@ Function Sweep($folderName)
     }
 }
 
+# STORE / UWP APPS, which the .lnk sweep above cannot see at all.
+#
+# A modern Windows app has NO shortcut anywhere: it exists only in AppsFolder, addressed by its
+# AUMID (PackageFamilyName!AppId). The sweep above reads *.lnk and nothing else, so Calculator,
+# Photos, Terminal, Clock, the Store and the rest were never reported, never appeared in dom0's
+# application list, and `qubes.StartApp+calculator` answered "not a built-in and has no AppMap
+# entry" - correctly, because there was none.
+#
+# MEASURED on win11-app, 2026-10-11: the guest's Start Menu holds 41 shortcuts - 28 under
+# ProgramData (Edge, Remote Desktop, Steps Recorder, Character Map, Component Services, Computer
+# Management, Disk Cleanup, Event Viewer, iSCSI Initiator, ...) and 13 under the user profile
+# (File Explorer, OneDrive, Magnify, Narrator, Command Prompt, Control Panel, Run, PowerShell,
+# ...). Every one a legacy or admin tool; not one modern app. Meanwhile Calculator is installed
+# and runnable. The owner, having tried it from the app menu: "there is no calculator entry in
+# start menu, to begin with".
+#
+# Get-StartApps is the right primitive because it returns what the Start Menu ACTUALLY SHOWS -
+# Name + AppID - for both kinds of entry. An AUMID always contains '!', which no file path does,
+# so that is the discriminator; .lnk-backed rows are skipped here because the sweep above already
+# reported them, with their icons.
+#
+# EVERY app is reported, deliberately. This file already carries the incident that settles it: the
+# Administrative Tools folder was once excluded to make a fresh qube's menu tidier and the owner
+# rejected it outright - "you silently dropped most of the apps and tell me that it is fine?".
+# What is AVAILABLE is not the place to make a menu usable; dom0's menu-items is.
+Function SweepStoreApps()
+{
+    $apps = @()
+    try { $apps = @(Get-StartApps -ErrorAction Stop) }
+    catch { LogWarning "Get-StartApps unavailable ($($_.Exception.Message)) - falling back to the package list" }
+
+    if ($apps.Count -eq 0) {
+        # FALLBACK, for the case where the Start Menu cmdlets are not present: build the AUMIDs
+        # from the installed packages and their manifests. Reports the same thing by a longer road.
+        try {
+            foreach ($pkg in @(Get-AppxPackage -ErrorAction Stop)) {
+                $mf = $null
+                try { $mf = Get-AppxPackageManifest $pkg -ErrorAction Stop } catch { continue }
+                foreach ($app in @($mf.Package.Applications.Application)) {
+                    if (-not $app.Id) { continue }
+                    $nm = $app.VisualElements.DisplayName
+                    if (-not $nm -or $nm -like 'ms-resource:*') { $nm = $pkg.Name }
+                    $apps += [PSCustomObject]@{ Name = $nm; AppID = ($pkg.PackageFamilyName + '!' + $app.Id) }
+                }
+            }
+        } catch { LogWarning "package-list fallback failed: $($_.Exception.Message)" }
+    }
+
+    foreach ($a in $apps) {
+        try {
+            $aumid = $a.AppID
+            if (-not $aumid -or ($aumid -notmatch '!')) { continue }   # a .lnk path has no '!'
+            $name = $a.Name
+            if (-not $name) { $name = $aumid.Split('!')[-1] }
+            $id = $name.Replace(' ', '_').Replace('\', '-')
+            # NEVER SILENTLY DROP AN APP. Skipping a clash would reproduce the failure the owner
+            # already rejected in this file ("you silently dropped most of the apps and tell me
+            # that it is fine?"). An entry the .lnk sweep already reported is genuinely a
+            # duplicate and is skipped with a line; a mere NAME clash between two distinct apps is
+            # disambiguated so both stay reachable.
+            if ($script:EmittedIds.ContainsKey((Get-QwtIdKey $id))) {
+                LogDebug "store app '$aumid' already reported as '$id' by the shortcut sweep - not duplicated"
+                continue
+            }
+            if ($script:EmittedNames.ContainsKey((Get-QwtNameKey $name))) {
+                $suffix = $aumid.Split('!')[0].Split('.')[-1]
+                $name = "$name ($suffix)"
+                $id = $name.Replace(' ', '_').Replace('\', '-')
+                LogWarning "store app '$aumid' clashes on display name - reported as '$name' so it stays reachable"
+            }
+
+            # The AppMap value start-app.ps1 resolves. It is a MONIKER, not a path - that service
+            # hands it to explorer, which performs the activation.
+            $moniker = 'shell:AppsFolder\' + $aumid
+            Set-AppMap (Get-QwtAppMapKey $id) $moniker
+
+            Emit-Entry $id 'Name' $name
+            Emit-Entry $id 'Exec' "qubes-rpc-multiplexer qubes.StartApp+$id"
+            Emit-Entry $id 'Comment' $aumid
+            # Icon: best effort. The package's own logo if we can find a readable file, mapped by
+            # hash the same way a shortcut's is, so GetImageRGBA can fetch it. No icon is better
+            # than a wrong one, so a miss simply omits the key.
+            try {
+                $fam = $aumid.Split('!')[0]
+                $pk = Get-AppxPackage -PackageFamilyName $fam -ErrorAction Stop | Select-Object -First 1
+                if ($pk -and $pk.InstallLocation) {
+                    $logo = @(Get-ChildItem -LiteralPath $pk.InstallLocation -Filter '*.png' -Recurse -ErrorAction SilentlyContinue |
+                              Where-Object { $_.Name -match 'Logo|Square44|Square150|StoreLogo' } |
+                              Sort-Object Length -Descending | Select-Object -First 1)
+                    if ($logo) {
+                        $h = GetHash($aumid)
+                        Set-AppMap $h $logo.FullName
+                        Emit-Entry $id 'Icon' $h
+                    }
+                }
+            } catch { }
+
+            $script:EmittedIds[(Get-QwtIdKey $id)] = $true
+            $script:EmittedNames[(Get-QwtNameKey $name)] = $true
+            $script:RecommendedIds += (Get-QwtDesktopName $id)
+        } catch {
+            LogWarning "store app '$($a.AppID)' could not be reported: $($_.Exception.Message)"
+        }
+    }
+}
+
 Sweep 'AllUsersPrograms'   # "All users" menu
 Sweep 'StartMenu'          # Current user menu
+SweepStoreApps             # AppsFolder entries, which have no .lnk to sweep
 
 # Pinned Start Menu items
 # FIXME: this doesn't work in win10 and there seems to be no official way of getting pinned tiles
