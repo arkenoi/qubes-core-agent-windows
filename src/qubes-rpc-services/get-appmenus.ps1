@@ -343,26 +343,48 @@ Function Sweep($folderName)
 # What is AVAILABLE is not the place to make a menu usable; dom0's menu-items is.
 Function SweepStoreApps()
 {
+    # BOTH SOURCES, MERGED - not one with the other as a fallback.
+    #
+    # Get-StartApps returns what the START MENU shows. The owner's objection is the reason this is
+    # not enough on its own: "but there is no calculator" - if an installed app is not listed in
+    # the Start Menu, it is not in Get-StartApps either, and a fallback that only runs when that
+    # cmdlet returns NOTHING would never fire for a PARTIAL list. The app would stay invisible for
+    # exactly the reason this whole change exists.
+    #
+    # Get-AppxPackage lists what is INSTALLED FOR THIS USER regardless of the Start Menu, and on
+    # the measured guest Calculator is there (STATUS Ok, USER user state=Installed) while absent
+    # from every Start Menu folder. So both are enumerated and merged, keyed on the AUMID, which is
+    # unique per app. Frameworks and resource packages carry no Applications entry in their
+    # manifest and so contribute nothing.
     $apps = @()
-    try { $apps = @(Get-StartApps -ErrorAction Stop) }
-    catch { LogWarning "Get-StartApps unavailable ($($_.Exception.Message)) - falling back to the package list" }
-
-    if ($apps.Count -eq 0) {
-        # FALLBACK, for the case where the Start Menu cmdlets are not present: build the AUMIDs
-        # from the installed packages and their manifests. Reports the same thing by a longer road.
-        try {
-            foreach ($pkg in @(Get-AppxPackage -ErrorAction Stop)) {
-                $mf = $null
-                try { $mf = Get-AppxPackageManifest $pkg -ErrorAction Stop } catch { continue }
-                foreach ($app in @($mf.Package.Applications.Application)) {
-                    if (-not $app.Id) { continue }
-                    $nm = $app.VisualElements.DisplayName
-                    if (-not $nm -or $nm -like 'ms-resource:*') { $nm = $pkg.Name }
-                    $apps += [PSCustomObject]@{ Name = $nm; AppID = ($pkg.PackageFamilyName + '!' + $app.Id) }
-                }
+    $seenAumid = @{}
+    try {
+        foreach ($a in @(Get-StartApps -ErrorAction Stop)) {
+            if ($a.AppID -and ($a.AppID -match '!') -and -not $seenAumid.ContainsKey($a.AppID)) {
+                $seenAumid[$a.AppID] = $true
+                $apps += $a
             }
-        } catch { LogWarning "package-list fallback failed: $($_.Exception.Message)" }
-    }
+        }
+    } catch { LogWarning "Get-StartApps unavailable ($($_.Exception.Message)) - the package list alone is used" }
+
+    try {
+        foreach ($pkg in @(Get-AppxPackage -ErrorAction Stop)) {
+            $mf = $null
+            try { $mf = Get-AppxPackageManifest $pkg -ErrorAction Stop } catch { continue }
+            foreach ($app in @($mf.Package.Applications.Application)) {
+                if (-not $app.Id) { continue }
+                $aum = $pkg.PackageFamilyName + '!' + $app.Id
+                if ($seenAumid.ContainsKey($aum)) { continue }
+                $seenAumid[$aum] = $true
+                $nm = $app.VisualElements.DisplayName
+                # An unresolved 'ms-resource:' indirection is not a name a human can read; the
+                # package's own Name is at least recognisable (Microsoft.WindowsCalculator).
+                if (-not $nm -or $nm -like 'ms-resource:*') { $nm = $pkg.Name }
+                $apps += [PSCustomObject]@{ Name = $nm; AppID = $aum }
+            }
+        }
+    } catch { LogWarning "installed-package enumeration failed: $($_.Exception.Message)" }
+    LogDebug "store apps to report: $($apps.Count)"
 
     foreach ($a in $apps) {
         try {
