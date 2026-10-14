@@ -169,11 +169,37 @@ try {
 # the wrong hive whenever this service does not run as the logged-on user - report that clearly
 # rather than dying.
 $target = $null
+# $mapHit, not just $target: in PowerShell both $null and '' are falsy, so testing $target alone
+# cannot tell "no AppMap entry for this name" from "the entry is there and empty". The two have
+# different answers - re-sync this qube, versus a bad map value - and reporting the first for the
+# second sends the operator to run a sync that will not help.
+$mapHit = $false
 try {
     $prop = Get-ItemProperty -Path "$RegistryMapPath\$RegistryMapKey" -Name $desktopBaseName -ErrorAction Stop
     $target = $prop.$desktopBaseName
-} catch {
-    Fail "'$desktopBaseName' is not a built-in and has no AppMap entry under $RegistryMapPath\$RegistryMapKey (HKCU of the service's user) - re-run qvm-sync-appmenus, or the shortcut is gone"
+    $mapHit = $true
+} catch { }
+
+# WHY 7 - THE MAP IS READ IN A DIFFERENT QUBE FROM THE ONE IT IS WRITTEN IN, and the fix is NOT
+# to scan at launch time.
+#
+# dom0 builds a template-based qube's application list from its TEMPLATE, so get-appmenus.ps1 runs
+# there and writes AppMap into the template's user hive, while qubes.StartApp runs in the APPVM
+# against the appvm's own hive. MEASURED on win11-app 2026-10-11, the owner launching Calculator
+# from the menu on a cold qube:
+#   [13:29:33] StartChild: Running '...start-app.ps1 "Calculator"' as user 'user'
+#   [13:29:53] 'Calculator' is not a built-in and has no AppMap entry under HKCU:\...\AppMap
+# The qube started and nothing appeared. Its user hive did hold 93 entries - a sync HAD run there -
+# but from before the store-app scan existed, so Calculator was not among them.
+#
+# A LAUNCH-TIME FALLBACK WAS TRIED HERE AND REMOVED. Resolving the id by enumerating installed
+# packages took longer than 200 s on this guest and returned nothing, leaving a powershell process
+# running and the caller hanging - for a menu click that is indistinguishable from the silent
+# failure this is all about, so it is a worse defect than the one it patched. The enumeration
+# belongs in the sync, where it is paid once and where it already is. The answer to a stale map is
+# to RE-SYNC THAT QUBE, which the message below says in those words.
+if (-not $mapHit) {
+    Fail "'$desktopBaseName' is not a built-in and has no AppMap entry under $RegistryMapPath\$RegistryMapKey (the HKCU of '$env:USERNAME', which is the hive THIS qube resolves against - a sync of the template does not populate it) - run qvm-sync-appmenus for THIS qube, or the app is gone"
 }
 if (-not $target) { Fail "'$desktopBaseName' resolved to an empty target" }
 
