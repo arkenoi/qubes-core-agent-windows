@@ -84,19 +84,47 @@ WCHAR* GetShortcutPath(OUT WCHAR *linkPath, IN DWORD linkPathLength)
 
     LogDebug("input converted: '%s'", valueName);
 
-    status = RegOpenKeyEx(HKEY_CURRENT_USER, APP_MAP_KEY, 0, KEY_READ, &key);
-    if (status != ERROR_SUCCESS)
-    {
-        win_perror2(status, "RegOpenKeyEx(AppMap key)");
-        goto cleanup;
-    }
-
-    size = linkPathLength * sizeof(WCHAR); // buffer size
+    // HKCU FIRST, THEN HKLM - the same two hives start-app.ps1 resolves a launch from, for the same
+    // reason (APPMAPWRONGHIVE). dom0 builds a template-based qube's application list from its
+    // TEMPLATE, so get-appmenus.ps1 runs there and writes HKCU, while this helper runs in the APPVM
+    // and reads the appvm's own HKCU - which lives on the per-qube PRIVATE volume and a template
+    // sync can never reach. HKLM comes from the ROOT volume, which the appvm DOES inherit, so the
+    // mirror written by the sync is what makes a template's icons resolvable here at all.
+    //
+    // This is the SECOND consumer of that map and it was missed by the first pass of the fix: the
+    // launch path was taught both hives and dom0's ICON path was left reading one, so a qube would
+    // have launched apps correctly and still shown no icons. Found by listing every reader of the
+    // key rather than by testing the launch.
     DWORD valueType;
-    status = RegQueryValueEx(key, valueName + strlen(INPUT_PREFIX), NULL, &valueType, (BYTE *) linkPath, &size);
+    const HKEY hives[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+    status = ERROR_FILE_NOT_FOUND;
+    for (int i = 0; i < 2; i++)
+    {
+        DWORD openStatus = RegOpenKeyEx(hives[i], APP_MAP_KEY, 0, KEY_READ, &key);
+        if (openStatus != ERROR_SUCCESS)
+        {
+            key = NULL;
+            status = openStatus;
+            continue;
+        }
+
+        size = linkPathLength * sizeof(WCHAR); // buffer size, reset per hive
+        status = RegQueryValueEx(key, valueName + strlen(INPUT_PREFIX), NULL, &valueType, (BYTE *) linkPath, &size);
+        if (status == ERROR_SUCCESS)
+        {
+            LogDebug("AppMap(%s) resolved from %s", valueName + strlen(INPUT_PREFIX),
+                     (i == 0) ? "HKCU (this qube's own sync)" : "HKLM (the mirror inherited from the template)");
+            break;
+        }
+
+        // not in this hive: close it and try the next, so a present-but-incomplete HKCU map does
+        // not shadow a mirror that has the entry.
+        RegCloseKey(key);
+        key = NULL;
+    }
     if (status != ERROR_SUCCESS)
     {
-        win_perror2(status, "RegQueryValueEx");
+        win_perror2(status, "AppMap lookup in HKCU and HKLM");
         goto cleanup;
     }
 

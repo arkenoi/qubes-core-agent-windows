@@ -62,6 +62,10 @@ function Fail($msg) {
 # Registry location for path hash -> full path mapping
 $RegistryMapPath = 'HKCU:\Software\Invisible Things Lab\Qubes Tools'
 $RegistryMapKey = 'AppMap'
+# HKCU FIRST, then the machine mirror. HKCU is this qube's own sync and is the freshest thing we
+# have; HKLM is inherited from the template through the root volume and is what makes a TEMPLATE
+# sync reach an appvm at all (APPMAPWRONGHIVE). Read-only here - this handler never writes either.
+$RegistryMapPathMachine = 'HKLM:\Software\Invisible Things Lab\Qubes Tools'
 
 $desktopBaseName = $args[0]
 if (-not $desktopBaseName) { Fail 'no application id given' }
@@ -174,11 +178,27 @@ $target = $null
 # different answers - re-sync this qube, versus a bad map value - and reporting the first for the
 # second sends the operator to run a sync that will not help.
 $mapHit = $false
-try {
-    $prop = Get-ItemProperty -Path "$RegistryMapPath\$RegistryMapKey" -Name $desktopBaseName -ErrorAction Stop
-    $target = $prop.$desktopBaseName
-    $mapHit = $true
-} catch { }
+$mapFrom = ''
+$mapEmptyIn = ''
+foreach ($hive in @($RegistryMapPath, $RegistryMapPathMachine)) {
+    try {
+        $prop = Get-ItemProperty -Path "$hive\$RegistryMapKey" -Name $desktopBaseName -ErrorAction Stop
+        $v = $prop.$desktopBaseName
+        # AN ENTRY THAT IS PRESENT BUT EMPTY MUST NOT END THE SEARCH. Taking the first hive that
+        # merely HAS the name lets a blank HKCU value shadow a good entry in the inherited mirror -
+        # and get-image-rgba.c, the other reader of this map, correctly moves on in that case, so
+        # the two consumers would have disagreed about the same name. Remember where the blank was
+        # so the "resolved to an empty target" diagnosis is still available if no hive answers.
+        if ([string]::IsNullOrWhiteSpace($v)) { if (-not $mapEmptyIn) { $mapEmptyIn = $hive }; continue }
+        $target = $v
+        $mapHit = $true
+        $mapFrom = $hive
+        break
+    } catch { }
+}
+if (-not $mapHit -and $mapEmptyIn) {
+    Fail "'$desktopBaseName' has an AppMap entry in $mapEmptyIn\$RegistryMapKey but it is EMPTY, and no other hive carries a usable one - the map was written wrong, so re-run qvm-sync-appmenus for THIS qube"
+}
 
 # WHY 7 - THE MAP IS READ IN A DIFFERENT QUBE FROM THE ONE IT IS WRITTEN IN, and the fix is NOT
 # to scan at launch time.
@@ -199,8 +219,11 @@ try {
 # belongs in the sync, where it is paid once and where it already is. The answer to a stale map is
 # to RE-SYNC THAT QUBE, which the message below says in those words.
 if (-not $mapHit) {
-    Fail "'$desktopBaseName' is not a built-in and has no AppMap entry under $RegistryMapPath\$RegistryMapKey (the HKCU of '$env:USERNAME', which is the hive THIS qube resolves against - a sync of the template does not populate it) - run qvm-sync-appmenus for THIS qube, or the app is gone"
+    Fail "'$desktopBaseName' is not a built-in and has no AppMap entry in either hive: $RegistryMapPath\$RegistryMapKey (the HKCU of '$env:USERNAME', this qube's own sync) or $RegistryMapPathMachine\$RegistryMapKey (the machine mirror inherited from the template) - run qvm-sync-appmenus for THIS qube, or re-sync the template so the mirror carries it, or the app is gone"
 }
+# WHICH hive answered is the diagnostic that distinguishes "this qube is synced" from "it is
+# running on the template's inherited mirror", and the two have different staleness.
+LogDebug "AppMap hit for '$desktopBaseName' in $mapFrom"
 if (-not $target) { Fail "'$desktopBaseName' resolved to an empty target" }
 
 LogDebug "Starting $target"

@@ -54,9 +54,41 @@ if (-not (Get-Command LogDebug -ErrorAction SilentlyContinue)) {
 # Registry location for path hash -> full path mapping for GetImageRGBA
 $RegistryMapPath = 'HKCU:\Software\Invisible Things Lab\Qubes Tools'
 $RegistryMapKey = 'AppMap'
+# HKLM MIRROR, because this script runs in a DIFFERENT QUBE from the one that reads the map.
+#
+# dom0 builds a template-based qube's application list from its TEMPLATE, so this script runs there
+# and writes HKCU - while qubes.StartApp runs in the APPVM and resolves against the appvm's own
+# HKCU. The user profile is on the PER-QUBE PRIVATE volume (measured: Q:\Users\...), so a template
+# sync can never reach an appvm's HKCU. Measured cost, win11-app 2026-10-11: the owner clicked
+# Calculator, the qube started, and the handler reported no AppMap entry (APPMAPWRONGHIVE).
+# HKLM lives in C:\Windows\System32\config on the ROOT volume, which an appvm DOES take from its
+# template, so a mirror there is inherited (Jev: premise 0.92, this fix 0.69 over the alternatives).
+#
+# WRITE ONLY, NO ACL CHANGES. The default HKLM\Software ACL is admin-write/user-read and is left
+# exactly as it is; if this sync is not elevated the mirror simply does not happen and says so ONCE.
+# HKCU stays the primary and is read first, so a qube that has been synced itself is unaffected.
+$RegistryMapPathMachine = 'HKLM:\Software\Invisible Things Lab\Qubes Tools'
+$script:MachineMapOk = $false
 
 try { New-Item -Path $RegistryMapPath -Name $RegistryMapKey -Force -ErrorAction Stop | Out-Null }
 catch { LogWarning "could not create the AppMap key: $($_.Exception.Message)" }
+
+# NOT -Force ON THE MACHINE KEY. For a registry key -Force RECREATES it, which DELETES the values
+# already there - and in an appvm those values ARE the template's inherited map. An appvm that ran
+# its own sync would have wiped the baseline it inherited and then repopulated it from its own view;
+# if that sync then failed partway, the qube would be left with less than it started with. HKLM is
+# copy-on-write per qube, so an appvm's write never reaches another qube - the only damage -Force
+# could do was to the qube doing the writing, which is exactly the one being helped. So: create the
+# key only when it is absent, and let the per-name writes below add or update individual entries.
+# The cost is that an app REMOVED since the last sync lingers in the mirror; it then fails at launch
+# with a real error from Start-Process instead of resolving, which is the acceptable direction.
+try {
+    if (-not (Test-Path "$RegistryMapPathMachine\$RegistryMapKey")) {
+        New-Item -Path $RegistryMapPathMachine -Name $RegistryMapKey -Force -ErrorAction Stop | Out-Null
+    }
+    $script:MachineMapOk = $true
+}
+catch { LogWarning "no HKLM AppMap mirror: $($_.Exception.Message). A TEMPLATE sync will not reach this template's appvms; each appvm needs its own sync." }
 
 try { $WshShell = New-Object -ComObject 'WScript.Shell' -ErrorAction Stop }
 catch { $WshShell = $null; LogWarning "WScript.Shell unavailable: $($_.Exception.Message)" }
@@ -244,6 +276,12 @@ Function Set-AppMap($name, $value)
 {
     try { New-ItemProperty -Path "$RegistryMapPath\$RegistryMapKey" -Name $name -PropertyType String -Value $value -Force -ErrorAction Stop | Out-Null }
     catch { LogWarning "AppMap write failed for '$name': $($_.Exception.Message)" }
+    # the mirror is best-effort and silent per entry: one failure line per 93 entries is noise, and
+    # the single reason was already reported where the key was created.
+    if ($script:MachineMapOk) {
+        try { New-ItemProperty -Path "$RegistryMapPathMachine\$RegistryMapKey" -Name $name -PropertyType String -Value $value -Force -ErrorAction Stop | Out-Null }
+        catch { $script:MachineMapOk = $false; LogWarning "HKLM AppMap mirror stopped at '$name': $($_.Exception.Message)" }
+    }
 }
 
 # Extract data from one shortcut file
