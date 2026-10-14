@@ -326,20 +326,31 @@ static DWORD QwCreateProcessAsSessionUser(
         inheritHandles = TRUE;
     }
 
-    // CREATE_NO_WINDOW IS NOT ENOUGH ON WINDOWS 11, and this is the "terminal blink" the owner
-    // sees on every qrexec call. A service command is `cmd.exe /c ...`; cmd is a console program,
-    // so Windows gives it a console, and on Win11 the DefTerm handoff re-hosts that console in
-    // WINDOWS TERMINAL - a real top-level window (class CASCADIA_HOSTING_WINDOW_CLASS) which the
-    // agent then maps, exactly as mgmt/harness/matrix.sh already records for the installer case.
-    // CREATE_NO_WINDOW asks for a console with no window; it does not stop the handoff.
+    // THE BLINK AND THE LOST OUTPUT, AND WHY THIS IS CREATE_NO_WINDOW AGAIN.
     //
-    // DETACHED_PROCESS asks for NO CONSOLE AT ALL, so there is nothing to hand off. It is only
-    // correct when the child's stdio comes from somewhere else - which is exactly the piped case,
-    // where STARTF_USESTDHANDLES supplies all three. Without pipes a console program would lose
-    // its stdio entirely, so that case keeps CREATE_NO_WINDOW.
-    // The two flags are mutually exclusive; passing both is an error.
-    DWORD creation = NORMAL_PRIORITY_CLASS | CREATE_UNICODE_ENVIRONMENT |
-                     (inheritHandles ? DETACHED_PROCESS : CREATE_NO_WINDOW);
+    // a52441a passed DETACHED_PROCESS in the piped case to kill the "terminal blink": a service
+    // command is `cmd.exe /c ...`, cmd is a console program, Windows gives it a console, and on
+    // Win11 the DefTerm handoff re-hosts that console in WINDOWS TERMINAL - a real top-level window
+    // (class CASCADIA_HOSTING_WINDOW_CLASS) the agent then maps. CREATE_NO_WINDOW asks for a
+    // console with no window and does not stop that handoff, so the reasoning was sound.
+    //
+    // WHAT IT COST, measured 2026-10-14 on a 4.3.36 guest: `qubes.VMExec` runs the command and
+    // returns its exit code but delivers NO stdout and NO stderr. `cmd /c echo X > file & echo Y`
+    // came back rc=0 with empty stdout while the FILE held X - the command ran, only its output
+    // vanished. dom0 drives the Windows update agent over this exact path, so a failing update pass
+    // reached dom0 as a bare rc=1 with its reason unreadable (findings/issues.md VMEXECNOSTDOUT,
+    // WUFIRSTCONTACTSILENT), and it blocked the 4.3.36 release.
+    //
+    // THE ATTRIBUTION IS NOT PROVEN YET, AND THIS REVERT IS HOW IT GETS PROVEN. Sixteen commits
+    // between 4.3.35's core-agent pointer and a52441a touch this file, and one of them (e0db61a)
+    // is why the user-context launch works at all now - on 4.3.35 the same call fails rc=46 before
+    // running anything, which is why a cross-release A/B cannot answer it. So this changes ONE
+    // expression and nothing else: if stdout returns, a52441a was the cause; if it does not, the
+    // cause is one of the other fifteen and this file says so.
+    //
+    // The blink comes back until a fix lands that costs no output. Do not re-introduce
+    // DETACHED_PROCESS here without a guest receipt showing stdout still arrives.
+    DWORD creation = NORMAL_PRIORITY_CLASS | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
     if (!CreateProcessAsUser(primary, NULL, commandLine, NULL, NULL, inheritHandles,
                              creation, environment, NULL, &si, &pi))
     {
