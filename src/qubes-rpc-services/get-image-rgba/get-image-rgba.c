@@ -95,7 +95,11 @@ WCHAR* GetShortcutPath(OUT WCHAR *linkPath, IN DWORD linkPathLength)
     // launch path was taught both hives and dom0's ICON path was left reading one, so a qube would
     // have launched apps correctly and still shown no icons. Found by listing every reader of the
     // key rather than by testing the launch.
-    DWORD valueType;
+    // INITIALISED, because the hive loop below may assign it on no iteration at all (both opens
+    // fail) and the compiler cannot prove the `status != ERROR_SUCCESS` guard stops it being read.
+    // /WX is on: C4701 "potentially uninitialized local variable" became C2220 and failed the
+    // package build (run 38546143949) - the whole reason guest verification had no package.
+    DWORD valueType = 0;
     const HKEY hives[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
     status = ERROR_FILE_NOT_FOUND;
     for (int i = 0; i < 2; i++)
