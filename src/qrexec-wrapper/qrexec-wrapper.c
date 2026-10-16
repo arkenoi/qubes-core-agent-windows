@@ -602,10 +602,24 @@ DWORD StartChild(
             CloseHandle(child->Stdin.WriteEndpoint);
             CloseHandle(child->Stdout.ReadEndpoint);
             CloseHandle(child->Stderr.ReadEndpoint);
-            return win_perror2(status, "CreatePipedProcessAsCurrentUser");
+            // ONE EVENT, ONE LINE - AND THIS ONE NAMED THE WRONG CALL. This tail is shared by
+            // both branches above, so when a user WAS named (the CreatePipedProcessAsUser path) it
+            // still reported "CreatePipedProcessAsCurrentUser failed", telling the reader a call
+            // that never ran had failed. MEASURED on win11-nfy 2026-10-16 - the cold-qube logon
+            // case this function already documents - as the pair
+            //     CreatePipedProcessAsUser: LogonUser failed with error 0x52e   (windows-utils)
+            //     StartChild: CreatePipedProcessAsCurrentUser failed with error 0x52e  (here)
+            // two ERROR lines for one logon, the second of them misnamed, both counted by
+            // error_lines_undeclared, whose max is 0.
+            // SAFE TO DROP, not merely quieter: windows-utils logs every failure path in exec.c
+            // itself (win_perror("LogonUser") at exec.c:192 is the first line above, and each
+            // status assignment there is a win_perror), so the OS error is already on record with
+            // its code and message. The caller keeps the status; g_FailureText still carries the
+            // user-facing text for the cold-qube case.
+            return status;
         }
 
-        return win_perror2(status, "CreateNormalProcessAsCurrentUser");
+        return status;
     }
 
     // Give the service payload the whole machine back. This process inherited qrexec-agent's
