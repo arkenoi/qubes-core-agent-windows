@@ -723,6 +723,18 @@ BOOL VchanSendMessage(
             LogDebug("vchan already closed, nothing left to send: msg 0x%x (%s)", messageType, what);
         else if (messageType == MSG_HELLO)
             LogWarning("peer gone before the handshake (msg 0x%x); request never served", messageType);
+        // ONE EVENT, ONE LINE (owner: "fix the double reporting, one teardown should be one line").
+        // When the drain backstop has expired, the line it wrote says in terms what happens next -
+        // "the peer will close the vchan on the exit code below, so this transfer is TRUNCATED" - so
+        // the exit code failing to reach a peer that has gone is the consequence it PREDICTED, not a
+        // second finding. EXIT_REASON_DRAIN_EXPIRED's own comment already says "already reported as
+        // a TRUNCATED transfer"; this is the code acting on it.
+        // MEASURED win11-reinstall, campaign run 38971675274: wrapper pid 7960 wrote THREE error
+        // lines for one truncation - the drain line, this one, and the caller's "sending exit code
+        // failed" - three of the five undeclared error lines that cell carried.
+        else if (messageType == MSG_DATA_EXIT_CODE && g_exitReason == EXIT_REASON_DRAIN_EXPIRED)
+            LogDebug("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - the "
+                L"truncated-transfer line above already reported this", cbData, what, messageType);
         else
             LogError("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - that "
                 L"output does not reach the peer", cbData, what, messageType);
@@ -1783,7 +1795,15 @@ DWORD EventLoop(
                 win_perror2(GetLastError(), "wait for i/o threads");
 
             if (!VchanSendExitCode(child, exitCode))
-                LogError("sending exit code failed");
+            {
+                // The callee has already said why, and after a drain expiry the drain's own line
+                // predicted it. Re-reporting it under this function's name is the duplicate-reporter
+                // shape killed in CreatePipedProcessAsCurrentUser on 2026-10-16.
+                if (g_exitReason == EXIT_REASON_DRAIN_EXPIRED)
+                    LogDebug("sending exit code failed - the truncated-transfer line above owns this");
+                else
+                    LogError("sending exit code failed");
+            }
 
             status = ERROR_SUCCESS;
             if (g_exitReason == EXIT_REASON_UNSET)
