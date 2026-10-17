@@ -259,40 +259,7 @@ DWORD WINAPI SetupNetwork()
     qubesIp = qdb_read(qdb, "/qubes-ip", NULL);
     if (!qubesIp)
     {
-        // A CONFIGURED ABSENCE IS NOT A FAILURE. This project's rule is that templates keep
-        // netvm='' and only the cells that test PV networking get one, so on most guests NONE of
-        // the network keys exist and there is nothing to set up. Reporting that at ERROR made
-        // every such boot carry an error line for its own configuration - 2 of them in run
-        // 38994277148, on cells with no netvm - and matrix.sh already had to declare this message
-        // TOLERATED for the per-cell sweep on exactly that ground. A declaration that exists only
-        // to excuse a wrong level is a note where a fix belongs.
-        //
-        // THE DISCRIMINATOR IS THE OTHER TWO KEYS, read only on this path. A qube with no netvm
-        // has all three absent; a networked qube has all three. Some present and this one missing
-        // is an inconsistent configuration and stays an ERROR, because then something really did
-        // fail to publish. Jev: level wrong, needs this discriminator 0.86 over the vif-crosscheck
-        // reading 0.12; both arms are real states on this rig 0.65.
-        //
-        // NOT THE SAME CLAIM AS AUDIT #11. That finding - "Work() decided 'no netvm' from ONE cold
-        // qdb_read of /qubes-ip right after qdb_open" - was fixed in the C# service half with
-        // retries and a vif cross-check, and this is NOT that fix: WaitForQdb() above has already
-        // returned, so qubesdb is up, but a race in which the keys arrive later is still possible
-        // and nothing here rules it out. What changes is only what this line SAYS about a state it
-        // cannot yet distinguish from a late publication. Said plainly rather than claimed as the
-        // cross-check (tools/tests/pvnic-netsetup-verdict-selftest.sh, knob COLDREAD, holds the
-        // service half's version of that line).
-        char *probeNetmask = qdb_read(qdb, "/qubes-netmask", NULL);
-        char *probeGateway = qdb_read(qdb, "/qubes-gateway", NULL);
-        if (!probeNetmask && !probeGateway)
-            LogInfo("no network configured for this qube: /qubes-ip, /qubes-netmask and "
-                    "/qubes-gateway are all absent from qubesdb, so there is nothing to set up");
-        else
-            LogError("Failed to get qubes-ip, yet /qubes-netmask%s and /qubes-gateway%s - this "
-                     "qube has a network configuration with its address missing",
-                     probeNetmask ? " is present" : " is absent",
-                     probeGateway ? " is present" : " is absent");
-        free(probeNetmask);
-        free(probeGateway);
+        LogError("Failed to get qubes-ip");
         goto cleanup;
     }
 
