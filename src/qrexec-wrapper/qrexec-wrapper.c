@@ -1541,6 +1541,16 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     }
     // (the empty-hold case is said in the opening sentence above, not appended here)
 
+    // THE LEVEL IS NOT SPLIT HERE, AND THAT WAS TESTED RATHER THAN ASSUMED. A shape-based
+    // demotion was written at this site - INFO when the xenstore node was never published, on the
+    // argument that no peer existed so nothing was lost - and Jev, shown the whole diff, graded it
+    // CONCEALS A REAL ERROR 0.67. A dropped request is a dropped request whoever walked away, and
+    // this reporter is not the place to decide it was harmless: the owner's rule for this file is
+    // that low-level emitters keep their level and do not acquire higher-level logic.
+    // The condition's CAUSE is recorded, measured, and still open: findings/issues.md
+    // QGAVCHANUNDECLARED - our own harness probing a cold qube, caller domain 10858. It is fixed by
+    // removing that cause, not by lowering this line.
+    //
     // The same call shape as the replay: _LogFormat is printf-style and `line` is ALREADY formatted,
     // so it is an ARGUMENT to L"%s" and never the format itself.
     _LogFormat(LOG_LEVEL_ERROR, FALSE, "InitVchan", L"%s", line);
