@@ -59,6 +59,10 @@ static CRITICAL_SECTION g_VchanCs;
 // the main thread leaves its wait, runs that same cleanup on its own thread, and signals g_ClosedEvent.
 #define CTRL_CLOSE_WAIT_MS 3000
 static HANDLE g_StopEvent = NULL;
+// WHICH control event arrived, so the event loop can tell an ending session (SHUTDOWN/LOGOFF -
+// ordinary, Info) from an interruption (C/BREAK/CLOSE - not ordinary, Warning). Written once by
+// WrapperCtrlHandler before it signals g_StopEvent, read after that signal is observed.
+static volatile DWORD g_CtrlType = 0xFFFFFFFF;
 static HANDLE g_ClosedEvent = NULL;
 
 // Set by wmain's cleanup just before it closes the data vchan, when nothing more is to be sent: the exit code (the
@@ -84,7 +88,25 @@ static BOOL WINAPI WrapperCtrlHandler(DWORD ctrlType)
     case CTRL_CLOSE_EVENT:
     case CTRL_LOGOFF_EVENT:
     case CTRL_SHUTDOWN_EVENT:
-        LogWarning("console control event %lu: closing the data vchan before exiting", ctrlType);
+        // THE MACHINE GOING DOWN IS NOT AN ANOMALY; BEING INTERRUPTED IS. SHUTDOWN (6) and LOGOFF
+        // (5) are the session ending under us, which is ordinary operation and happens on every
+        // single guest halt - "no warnings on normal operation. warning means something is not
+        // quite normal, yet workable" (owner, 2026-10-08). C (0), BREAK (1) and CLOSE (2) mean
+        // somebody interrupted this process, which is not ordinary, and they keep their warning.
+        //
+        // MEASURED, campaign 20261018-143438: a dom0 call was in flight when the harness halted the
+        // guest, and this clean teardown cost two WARNING lines that failed the campaign's error
+        // gate - "console control event 6" here and "stop requested by a console control event" in
+        // the event loop - with the clean path confirmed on the very next line. Jev, shown the
+        // sequence: demote_shutdown 0.99.
+        //
+        // THE FAILURE PATH IS UNTOUCHED: a vchan not confirmed closed within CTRL_CLOSE_WAIT_MS
+        // still raises an ERROR below, whatever the event was.
+        if (ctrlType == CTRL_SHUTDOWN_EVENT || ctrlType == CTRL_LOGOFF_EVENT)
+            LogInfo("console control event %lu (the session is ending): closing the data vchan before exiting", ctrlType);
+        else
+            LogWarning("console control event %lu: closing the data vchan before exiting", ctrlType);
+        g_CtrlType = ctrlType;   // so the event loop can tell an ending session from an interruption
         if (g_StopEvent)
             SetEvent(g_StopEvent);
         if (g_ClosedEvent && WaitForSingleObject(g_ClosedEvent, CTRL_CLOSE_WAIT_MS) == WAIT_OBJECT_0)
@@ -1787,7 +1809,11 @@ DWORD EventLoop(
             }
             if (stopped)
             {
-                LogWarning("stop requested by a console control event while draining - leaving now");
+                // Same split as the handler: the session ending is ordinary, an interruption is not.
+                if (g_CtrlType == CTRL_SHUTDOWN_EVENT || g_CtrlType == CTRL_LOGOFF_EVENT)
+                    LogInfo("stop requested by the session ending (control event %lu) while draining - leaving now", g_CtrlType);
+                else
+                    LogWarning("stop requested by a console control event while draining - leaving now");
                 status = ERROR_OPERATION_ABORTED;
                 g_exitReason = EXIT_REASON_CTRL_STOP;
                 CloseHandle(child->Process);
@@ -1826,7 +1852,10 @@ DWORD EventLoop(
 
         case 2: // console-control shutdown: leave now, wmain's cleanup closes the vchan on this thread
         {
-            LogWarning("stop requested by a console control event - leaving the event loop");
+            if (g_CtrlType == CTRL_SHUTDOWN_EVENT || g_CtrlType == CTRL_LOGOFF_EVENT)
+                LogInfo("stop requested by the session ending (control event %lu) - leaving the event loop", g_CtrlType);
+            else
+                LogWarning("stop requested by a console control event - leaving the event loop");
             status = ERROR_OPERATION_ABORTED;
             g_exitReason = EXIT_REASON_CTRL_STOP;
             run = FALSE;
@@ -1948,7 +1977,10 @@ int wmain(int argc, WCHAR *argv[])
             DWORD signaled = WaitForMultipleObjects(g_StopEvent ? 2 : 1, waits, FALSE, INFINITE);
             if (signaled == WAIT_OBJECT_0 + 1)
             {
-                LogWarning("stop requested by a console control event");
+                if (g_CtrlType == CTRL_SHUTDOWN_EVENT || g_CtrlType == CTRL_LOGOFF_EVENT)
+                    LogInfo("stop requested by the session ending (control event %lu)", g_CtrlType);
+                else
+                    LogWarning("stop requested by a console control event");
                 status = ERROR_OPERATION_ABORTED;
                 goto cleanup;
             }
