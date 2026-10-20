@@ -151,6 +151,14 @@ static EXIT_REASON g_exitReason = EXIT_REASON_UNSET;
 // Set when the closed-vchan path has already reported a real loss, WITH the byte count, so
 // the exit path does not report the same teardown a second time. See VchanSendMessage.
 static BOOL g_LossReported = FALSE;
+// WHAT THE DATA ERROR ACTUALLY WAS. EXIT_REASON_DATA_ERROR's name is the literal string "a data
+// error", and the caller below DISCARDED the Win32 status HandleDataMessage had just returned, so
+// the only thing reaching the log was a label. Measured on acceptance run 39476792836, 2026-10-20:
+// win10-clean, win10-reinstall and win10-upgrade all breached error_lines_undeclared on this line
+// and NOTHING in the evidence could say why - the code knew and did not write it down. The owner's
+// rule on that metric is that an error line our own code wrote, whose cause this run did not
+// declare, is a defect to fix at its cause. This is the cause being written down.
+static DWORD g_DataErrorStatus = ERROR_SUCCESS;
 
 static const WCHAR *ExitReasonName(EXIT_REASON r)
 {
@@ -1748,6 +1756,10 @@ DWORD EventLoop(
                 status = HandleDataMessage(child);
                 if (status != ERROR_SUCCESS)
                 {
+                    // KEEP IT: `status` is the reason, in hand, at the moment of failure. The
+                    // FIRST one, not the last - a later failure is usually a consequence.
+                    if (g_DataErrorStatus == ERROR_SUCCESS)
+                        g_DataErrorStatus = status;
                     g_exitReason = EXIT_REASON_DATA_ERROR;
                     run = FALSE;
                 }
@@ -2148,8 +2160,15 @@ cleanup:
         else
             // A data error, a stop, or a reason nobody recorded: output this call produced may
             // never have reached the peer, and nothing else says so.
-            LogError("an output pump is still running at exit - %s: output this call produced may "
-                     "not have reached the peer", ExitReasonName(g_exitReason));
+            // ONE LogError, not two: the ERROR branch is the last and unconditional one, which is
+            // what makes an exit path someone adds later land in it (wrapper-exit-reason-selftest
+            // asserts exactly one). The cause goes in a suffix rather than a second call.
+            WCHAR _why[64] = L"";
+            if (g_exitReason == EXIT_REASON_DATA_ERROR && g_DataErrorStatus != ERROR_SUCCESS)
+                StringCchPrintf(_why, RTL_NUMBER_OF(_why), L" (HandleDataMessage failed with 0x%x)",
+                                g_DataErrorStatus);
+            LogError("an output pump is still running at exit - %s%s: output this call produced may "
+                     "not have reached the peer", ExitReasonName(g_exitReason), _why);
     }
     if (g_ClosedEvent)
         SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
