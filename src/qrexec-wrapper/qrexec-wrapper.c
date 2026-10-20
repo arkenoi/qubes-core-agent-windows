@@ -2093,6 +2093,8 @@ cleanup:
     if (child)
     {
         BOOL pumpsFinished = TRUE;
+        // C89 in this translation unit: declared here, not where it is used below.
+        WCHAR whyBuf[64] = L"";
 
         if (child->Vchan)
         {
@@ -2172,12 +2174,11 @@ cleanup:
             // ONE LogError, not two: the ERROR branch is the last and unconditional one, which is
             // what makes an exit path someone adds later land in it (wrapper-exit-reason-selftest
             // asserts exactly one). The cause goes in a suffix rather than a second call.
-            WCHAR _why[64] = L"";
             if (g_exitReason == EXIT_REASON_DATA_ERROR && g_DataErrorStatus != ERROR_SUCCESS)
-                StringCchPrintf(_why, RTL_NUMBER_OF(_why), L" (HandleDataMessage failed with 0x%x)",
-                                g_DataErrorStatus);
+                StringCchPrintf(whyBuf, RTL_NUMBER_OF(whyBuf),
+                                L" (HandleDataMessage failed with 0x%x)", g_DataErrorStatus);
             LogError("an output pump is still running at exit - %s%s: output this call produced may "
-                     "not have reached the peer", ExitReasonName(g_exitReason), _why);
+                     "not have reached the peer", ExitReasonName(g_exitReason), whyBuf);
     }
     if (g_ClosedEvent)
         SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
