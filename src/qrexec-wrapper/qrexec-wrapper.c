@@ -541,9 +541,11 @@ DWORD StartChild(
 
     // if launchUser is NULL we run the process on behalf of the current user (SYSTEM).
     if (launchUser)
-        LogInfo("Running '%s' as user '%s'", commandLine, launchUser);
+        // PER-CALL MECHANICS ARE DEBUG - see the note on the data-protocol line above. This pair
+        // fired 127 times in one brief cell of run 39476792836.
+        LogDebug("Running '%s' as user '%s'", commandLine, launchUser);
     else
-        LogInfo("Running '%s' as SYSTEM", commandLine);
+        LogDebug("Running '%s' as SYSTEM", commandLine);
 
     if (piped)
     {
@@ -1065,7 +1067,14 @@ DWORD HandleDataMessage(
         // case): the peer only sends larger chunks after it has our hello.
         InterlockedExchange(&child->DataVersion,
             peerInfo.version < DATA_PROTOCOL_VERSION ? (LONG)peerInfo.version : DATA_PROTOCOL_VERSION);
-        LogInfo("data protocol version %ld (peer %d, ours %d)", child->DataVersion, peerInfo.version, DATA_PROTOCOL_VERSION);
+        // PER-CALL MECHANICS ARE DEBUG. qrexec-wrapper and qrexec-agent run once per qrexec call,
+        // and a campaign makes hundreds: measured on acceptance run 39476792836, 2026-10-20, one
+        // brief cell logged 149 of this line alone, and the guest session read 2535 INFO against
+        // 52 WARN and 2 ERROR. Owner 2026-10-20: "it is NOT normal to have thousands of lines of
+        // log during the brief normal run. it is ok for debug purposes but not on a product
+        // session." This describes the mechanics of a call, not an event; at LOG_LEVEL_DEBUG it
+        // comes back.
+        LogDebug("data protocol version %ld (peer %d, ours %d)", child->DataVersion, peerInfo.version, DATA_PROTOCOL_VERSION);
 
         if (!child->IsVchanServer) // we're vchan client, reply with HELLO
         {

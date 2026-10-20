@@ -331,7 +331,14 @@ static DWORD ParseUtf8Command(IN const char* commandUtf8, OUT WCHAR** userName,
         return win_perror2(status, "ConvertUTF8ToUTF16(command)");
     }
 
-    LogInfo("Command: %s", commandUtf16);
+    // PER-CALL MECHANICS ARE DEBUG. qrexec-wrapper and qrexec-agent run once per qrexec call,
+    // and a campaign makes hundreds: measured on acceptance run 39476792836, 2026-10-20, one
+    // brief cell logged 149 of this line alone, and the guest session read 2535 INFO against
+    // 52 WARN and 2 ERROR. Owner 2026-10-20: "it is NOT normal to have thousands of lines of
+    // log during the brief normal run. it is ok for debug purposes but not on a product
+    // session." This describes the mechanics of a call, not an event; at LOG_LEVEL_DEBUG it
+    // comes back.
+    LogDebug("Command: %s", commandUtf16);
 
     separator = wcschr(commandUtf16, L':');
     if (!separator)
@@ -715,7 +722,14 @@ static PCWSTR NormalizeUserName(IN PCWSTR requested)
 {
     if (requested && (!_wcsicmp(requested, L"SYSTEM") || !_wcsicmp(requested, L"root")))
     {
-        LogInfo("user '%s' is this service's own account: no logon, the child runs on the service's token", requested);
+        // PER-CALL MECHANICS ARE DEBUG. qrexec-wrapper and qrexec-agent run once per qrexec call,
+        // and a campaign makes hundreds: measured on acceptance run 39476792836, 2026-10-20, one
+        // brief cell logged 149 of this line alone, and the guest session read 2535 INFO against
+        // 52 WARN and 2 ERROR. Owner 2026-10-20: "it is NOT normal to have thousands of lines of
+        // log during the brief normal run. it is ok for debug purposes but not on a product
+        // session." This describes the mechanics of a call, not an event; at LOG_LEVEL_DEBUG it
+        // comes back.
+        LogDebug("user '%s' is this service's own account: no logon, the child runs on the service's token", requested);
         return NULL;
     }
     return requested;
