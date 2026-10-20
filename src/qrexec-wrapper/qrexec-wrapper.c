@@ -148,6 +148,9 @@ typedef enum {
     EXIT_REASON_CTRL_STOP,       // a console control event asked us to stop
 } EXIT_REASON;
 static EXIT_REASON g_exitReason = EXIT_REASON_UNSET;
+// Set when the closed-vchan path has already reported a real loss, WITH the byte count, so
+// the exit path does not report the same teardown a second time. See VchanSendMessage.
+static BOOL g_LossReported = FALSE;
 
 static const WCHAR *ExitReasonName(EXIT_REASON r)
 {
@@ -758,8 +761,19 @@ BOOL VchanSendMessage(
             LogDebug("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - the "
                 L"truncated-transfer line above already reported this", cbData, what, messageType);
         else
+        {
+            // ONE EVENT, ONE LINE. This is the line that REPORTS the loss, with the amount; the
+            // exit path below would otherwise say it a second time as "an output pump is still
+            // running at exit - a data error", because a send that finds the vchan closed fails
+            // HandleDataMessage and latches EXIT_REASON_DATA_ERROR. Two error lines for one
+            // teardown is the double reporting the owner named, and the DRAIN_EXPIRED arm above
+            // is the same demotion for the same reason. Measured on acceptance run 39225775322:
+            // both lines appeared together, in the same second, for one lost 2-byte reply, and
+            // together they breached error_lines_undeclared on two cells.
+            g_LossReported = TRUE;
             LogError("vchan already closed with %u byte(s) of %s (msg 0x%x) still to send - that "
                 L"output does not reach the peer", cbData, what, messageType);
+        }
         goto cleanup;
     }
 
@@ -2122,6 +2136,10 @@ cleanup:
             // Expected: the loop left on the ordinary end, which does not wait for the pumps. The
             // peer has what it asked for and the state is reclaimed by the process exit.
             LogDebug("an output pump is still running at exit - %s (ordinary end)",
+                     ExitReasonName(g_exitReason));
+        else if (g_exitReason == EXIT_REASON_DATA_ERROR && g_LossReported)
+            // Already reported above, with the amount, by the line that saw the vchan closed.
+            LogDebug("an output pump is still running at exit - %s (the loss is reported above)",
                      ExitReasonName(g_exitReason));
         else if (g_exitReason == EXIT_REASON_DRAIN_EXPIRED)
             // Already reported above as a TRUNCATED transfer; saying it twice buries the first one.
