@@ -2153,6 +2153,11 @@ cleanup:
                 pumpsFinished = FALSE;
             CloseHandle(child->StderrThread);
         }
+        /* WRAPPER-EXIT-CHAIN-BEGIN  (to the END marker: tools/tests/wrapper-exit-emit-selftest.sh
+           EXTRACTS this chain, COMPILES it against stubs and RUNS it for every exit reason. It is
+           compiled and executed rather than grepped, because the previous suite counted how many
+           times LogError appeared in this FILE - which a missing brace does not change - and the
+           missing brace shipped. Neither marker names the other.) */
         if (pumpsFinished)
             free(child);
         else if (g_exitReason == EXIT_REASON_PEER_CLOSED || g_exitReason == EXIT_REASON_CHILD_DRAINED)
@@ -2169,16 +2174,31 @@ cleanup:
             LogDebug("an output pump is still running at exit - %s (reported above)",
                      ExitReasonName(g_exitReason));
         else
+        {
             // A data error, a stop, or a reason nobody recorded: output this call produced may
             // never have reached the peer, and nothing else says so.
             // ONE LogError, not two: the ERROR branch is the last and unconditional one, which is
             // what makes an exit path someone adds later land in it (wrapper-exit-reason-selftest
             // asserts exactly one). The cause goes in a suffix rather than a second call.
+            //
+            // THESE BRACES ARE THE FIX, AND THEIR ABSENCE SHIPPED. Without them this `else`
+            // governed only the `if` below it, and the LogError was a SIBLING of the whole chain -
+            // so it ran on every pass, including the ordinary ends that had just logged Debug one
+            // line above, and including the pumpsFinished path where the child was freed.
+            // MEASURED in the 4.3.37 acceptance campaign, cell win10-clean, 2026-10-21: 141 ERROR
+            // lines reading "an output pump is still running at exit - the child exited and its
+            // output was drained" plus 3 for "the peer closed the vchan" - the two reasons the
+            // branch ABOVE routes to Debug as an ordinary end. That was 141 of the cell's 145
+            // undeclared error lines, and error_lines_undeclared has a max of 0.
+            // It is not a race: g_exitReason is correct and unchanged throughout. The reason text
+            // was right, the level was not, and nothing about threads is involved.
             if (g_exitReason == EXIT_REASON_DATA_ERROR && g_DataErrorStatus != ERROR_SUCCESS)
                 StringCchPrintf(whyBuf, RTL_NUMBER_OF(whyBuf),
                                 L" (HandleDataMessage failed with 0x%x)", g_DataErrorStatus);
             LogError("an output pump is still running at exit - %s%s: output this call produced may "
                      "not have reached the peer", ExitReasonName(g_exitReason), whyBuf);
+        }
+        /* WRAPPER-EXIT-CHAIN-END */
     }
     if (g_ClosedEvent)
         SetEvent(g_ClosedEvent); // tells a waiting console-control handler that the vchan is released
