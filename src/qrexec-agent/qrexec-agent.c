@@ -103,44 +103,174 @@ static struct _connection_info connection_info[MAX_FDS];
 // connect window plus its post-connect sync.
 #define QDB_WAIT_TIMEOUT_MS ((5 * 60 + 60) * 1000)
 
+// THE WHOLE RETRY LOOP, on one thread, so the waiter below can give up on a qdb_open that never
+// returns. ONE thread for the entire wait, not one per attempt: the retry cadence and the deadline
+// belong to the thread, so the waiter's own timeout fires ONLY when a call is genuinely stuck, and
+// a slow boot does not create a thread a second for six minutes.
+// The context is heap-allocated because in the one case where the thread cannot be reclaimed it
+// outlives the waiter and writes `handle` into it. Every other path frees it.
+struct QDB_OPEN_CALL
+{
+    HANDLE stopEvent;       // the service stop event, so a shutdown is never held up
+    ULONGLONG deadline;     // GetTickCount64() past which this thread gives up by itself
+    qdb_handle_t handle;    // written by the thread, read by the waiter after the thread signals
+};
+
+static DWORD WINAPI QdbOpenThread(PVOID param)
+{
+    struct QDB_OPEN_CALL* call = (struct QDB_OPEN_CALL*)param;
+
+    while (GetTickCount64() < call->deadline)
+    {
+        qdb_handle_t qdb = qdb_open(NULL);
+
+        if (qdb != NULL)
+        {
+            call->handle = qdb;
+            return ERROR_SUCCESS;
+        }
+
+        // A multi-minute wait must not hold up a stop request (shutdown), so wait on the stop
+        // event instead of sleeping. Unchanged from the inline loop this replaces.
+        if (WaitForSingleObject(call->stopEvent, 1000) == WAIT_OBJECT_0)
+            return ERROR_CANCELLED;
+    }
+
+    return ERROR_TIMEOUT;
+}
+
 /**
  * @brief Wait for qubesdb service to start.
  * @param stopEvent Service stop event; the wait aborts when it is signaled.
  * @return ERROR_SUCCESS if a connection could be opened, ERROR_CANCELLED if the service
  *         was asked to stop while waiting, ERROR_TIMEOUT if qubesdb never answered.
  */
+// THE BOUND HAS TO COVER THE CALL, NOT ONLY THE GAPS BETWEEN CALLS. This loop used to call
+// qdb_open() inline, so QDB_WAIT_TIMEOUT_MS was tested only between calls and an invocation that
+// never returned was never interrupted - the documented "ERROR_TIMEOUT if qubesdb never answered"
+// could not happen. MEASURED 2026-10-24 on win11r-sup, one qdb_open per leg in a child process
+// stamping its own file: daemon running -> returned in 184 ms (and 338/148/67 ms on repeats);
+// daemon ABSENT (service Stopped, process gone) -> returned NULL in 156 ms; daemon ALIVE BUT NOT
+// ANSWERING (process suspended, its client pipe still there with nobody servicing it) -> did NOT
+// return within 90 s, stamped 87063 ms, and came back 67 ms after the resume. So the old bound
+// worked in exactly the case it was written for - the boot-order case in the comment above the
+// constant, where the pipe does not exist yet and the call fails fast - and was inert in the one
+// that matters: supervision cell L10 held the daemon suspended for 421 s against a 360 s bound and
+// the service start simply stopped there. Instance pid 7840 logged its QWTBIRTH at 21:49:35.217
+// and then nothing at all until 21:56:37.183, one second after the resume, with no timeout line.
+// The guest sat in SERVICE_RUNNING (the SCM state is reported before this worker runs) with no
+// qrexec at all, nothing logged at W or E, and none of the installer's failure actions could fire
+// because nothing had failed. qdb_open is stock qubesdb client code with no timeout of its own, so
+// the bound lives here. Jev: thread-with-bound 0.89, ours-to-fix 0.70 (scratchpad/jev-qdbbound-*).
+//
+// AND IT IS THE SIMPLEST SHAPE THAT DOES THAT, deliberately. A first cut also called
+// CancelSynchronousIo on the stuck thread, waited a grace period for it to unwind and mapped its
+// exit code, so that every path reclaimed what it allocated: 103 code lines against this one's 86
+// and the original's 28. Asked whether that was overengineered, Jev said yes (0.64), rated the
+// cancel's value at exactly chance (0.50) and named this shape - one thread owning the retry loop
+// and its own deadline, with the one stuck case abandoned - as the simplest sufficient design
+// (0.43, against 0.24 for the cancelling version). scratchpad/jev-qdbsimple-out.json. What is NOT
+// simplified away: the WAIT_FAILED branch, because reporting a bad handle as a qubesdb timeout
+// would name the wrong cause, and the thread's own deadline, because without it a thread the
+// waiter has given up on would spin for the life of the process.
 static DWORD WaitForQdb(HANDLE stopEvent)
 {
-    qdb_handle_t qdb = NULL;
     ULONGLONG start = GetTickCount64();
-    ULONGLONG tick = start;
+    struct QDB_OPEN_CALL* call;
+    HANDLE thread;
+    HANDLE waits[2];
+    DWORD waited;
+    DWORD threadStatus;
+    DWORD grace;
+    qdb_handle_t qdb;
 
     LogDebug("start");
-    while (qdb == NULL && (tick - start) < QDB_WAIT_TIMEOUT_MS)
+    call = (struct QDB_OPEN_CALL*)malloc(sizeof(struct QDB_OPEN_CALL));
+    if (!call)
+        return win_perror2(ERROR_OUTOFMEMORY, "allocating the qdb_open call context");
+
+    // THE THREAD GIVES UP SLIGHTLY BEFORE THE WAITER DOES, so the TOTAL bound stays exactly
+    // QDB_WAIT_TIMEOUT_MS. Waiting the full budget here and giving the thread the same deadline
+    // would have made the two race, and the waiter wins: every ordinary no-daemon-yet wait would
+    // then come out of the "stuck" branch and be logged as a daemon that is running but not
+    // answering, which is a different fact. Adding a grace to the WAITER instead would stretch the
+    // documented 360 s to 362 s - a changed timeout, which this fix is not allowed to be. So the
+    // head start goes to the thread. It is a quarter of the budget at most, which keeps a
+    // small-budget build (the offline test redefines it to 1500 ms) from underflowing.
+    grace = QDB_WAIT_TIMEOUT_MS / 4 < 2000 ? QDB_WAIT_TIMEOUT_MS / 4 : 2000;
+    call->stopEvent = stopEvent;
+    call->deadline = start + QDB_WAIT_TIMEOUT_MS - grace;
+    call->handle = NULL;
+
+    thread = CreateThread(NULL, 0, QdbOpenThread, call, 0, NULL);
+    if (!thread)
     {
-        qdb = qdb_open(NULL);
-        if (qdb == NULL)
-        {
-            // A multi-minute wait must not hold up a stop request (shutdown), so wait on the
-            // stop event instead of sleeping.
-            if (WaitForSingleObject(stopEvent, 1000) == WAIT_OBJECT_0)
-            {
-                LogDebug("stop requested while waiting for qdb");
-                return ERROR_CANCELLED;
-            }
-        }
-        tick = GetTickCount64();
+        DWORD status = GetLastError();
+
+        free(call);
+        return win_perror2(status, "CreateThread(qdb_open)");
     }
 
-    if (qdb == NULL)
+    // The thread owns the retry cadence AND its own (earlier) deadline, so it normally ends by
+    // itself - with a handle, with ERROR_CANCELLED on a stop, or with ERROR_TIMEOUT. That head
+    // start is what makes this wait's own expiry mean one specific thing: a qdb_open that is
+    // genuinely stuck. This is the only bound the caller ever experiences, and it is the
+    // documented one, unchanged.
+    waits[0] = stopEvent;
+    waits[1] = thread;
+    waited = WaitForMultipleObjects(2, waits, FALSE, QDB_WAIT_TIMEOUT_MS);
+
+    if (waited == WAIT_OBJECT_0 + 1)
     {
+        // The thread ended: its own outcome decides, and nothing is left behind.
+        if (!GetExitCodeThread(thread, &threadStatus))
+            threadStatus = ERROR_TIMEOUT;
+        qdb = call->handle;
+        CloseHandle(thread);
+        free(call);
+
+        if (qdb != NULL)
+        {
+            qdb_close(qdb);
+            LogDebug("qdb is running after %I64u ms", GetTickCount64() - start);
+            return ERROR_SUCCESS;
+        }
+        if (threadStatus == ERROR_CANCELLED)
+        {
+            LogDebug("stop requested while waiting for qdb");
+            return ERROR_CANCELLED;
+        }
         LogError("timed out after %u ms: connect to qdb server", QDB_WAIT_TIMEOUT_MS);
         return ERROR_TIMEOUT;
     }
 
-    qdb_close(qdb);
-    LogDebug("qdb is running after %I64u ms", tick - start);
-    return ERROR_SUCCESS;
+    if (waited == WAIT_FAILED)
+    {
+        // Not a qubesdb fact at all, so it is not reported as a timeout: say what failed.
+        DWORD status = GetLastError();
+
+        CloseHandle(thread);
+        return win_perror2(status, "WaitForMultipleObjects(qdb_open, stop)");
+    }
+
+    // A stop request, or a call still stuck past the deadline. Both leave the thread and its
+    // context alive ON PURPOSE: a qdb_open that returns later writes the handle into that context,
+    // so it must outlive this function, and the process is exiting within seconds either way - on
+    // a stop because that is what was asked for, on a timeout because ERROR_TIMEOUT ends the
+    // service. Reclaiming them would mean cancelling the stock client library's synchronous I/O,
+    // which buys back one thread and 24 bytes from a process that is going away (Jev: the cancel
+    // earns its complexity 0.50, this design over that one 0.43 vs 0.24).
+    CloseHandle(thread);
+    if (waited == WAIT_OBJECT_0)
+    {
+        LogDebug("stop requested while waiting for qdb");
+        return ERROR_CANCELLED;
+    }
+
+    LogWarning("a qdb_open has not returned in %u ms: qubesdb is running but not answering",
+               QDB_WAIT_TIMEOUT_MS);
+    LogError("timed out after %u ms: connect to qdb server", QDB_WAIT_TIMEOUT_MS);
+    return ERROR_TIMEOUT;
 }
 
 /**
