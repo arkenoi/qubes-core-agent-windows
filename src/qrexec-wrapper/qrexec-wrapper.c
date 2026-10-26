@@ -1063,8 +1063,15 @@ DWORD HandleDataMessage(
         }
 
         // Negotiated data version = min(ours, peer's). The peer computes the same from our hello, so from
-        // here on both sides may use chunks up to max_data_chunk(version). Set BEFORE we reply (client
-        // case): the peer only sends larger chunks after it has our hello.
+        // here on both sides may use chunks up to max_data_chunk(version).
+        //
+        // WHAT KEEPS THIS AHEAD OF THE FIRST LARGE CHUNK. Our hello now goes out in InitVchan, before
+        // this runs, so the peer may send a 64 KiB chunk while DataVersion is still the v2 limit set at
+        // wmain - and HandleDataMessage above rejects a chunk over the limit outright. It cannot arrive
+        // first: the peer's own hello precedes its data on the same ring, there is ONE reader (every
+        // HandleDataMessage call site is sequential in EventLoop/wmain), so the hello is parsed and the
+        // version raised before any chunk reaches that size check. The guarantee is stream ORDER, not
+        // the reply this case used to send - which is why deleting that reply did not take it away.
         InterlockedExchange(&child->DataVersion,
             peerInfo.version < DATA_PROTOCOL_VERSION ? (LONG)peerInfo.version : DATA_PROTOCOL_VERSION);
         // PER-CALL MECHANICS ARE DEBUG. qrexec-wrapper and qrexec-agent run once per qrexec call,
