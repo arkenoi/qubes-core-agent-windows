@@ -84,7 +84,4 @@ typedef struct _CHILD_STATE
     // Read by the stdout/stderr threads while the main thread may set it, hence volatile LONG + Interlocked.
     volatile LONG DataVersion;
 
-    // Our MSG_HELLO has gone out on the data vchan (the server sends it in InitVchan, the client replies to the peer's).
-    // The final cleanup sends one only if not: a second hello on a vchan that already carried data is a protocol error.
-    BOOL         HelloSent;
 } CHILD_STATE, *PCHILD_STATE;

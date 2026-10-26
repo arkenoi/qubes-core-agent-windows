@@ -1076,12 +1076,12 @@ DWORD HandleDataMessage(
         // comes back.
         LogDebug("data protocol version %ld (peer %d, ours %d)", child->DataVersion, peerInfo.version, DATA_PROTOCOL_VERSION);
 
-        if (!child->IsVchanServer) // we're vchan client, reply with HELLO
-        {
-            if (!VchanSendHello(child->Vchan))
-                return ERROR_INVALID_FUNCTION;
-            child->HelloSent = TRUE;
-        }
+        // Nothing is sent from here any more. The qrexec data handshake is symmetric - each side
+        // sends its hello and then reads the peer's (qubes-core-qrexec 4.3.14,
+        // qrexec/tests/socket/qrexec.py:100-104 handshake(): send_message(MSG_HELLO) then
+        // recv_message(); daemon.py:229-231 the same) - so ours went out in InitVchan and this
+        // message is read for the peer's VERSION alone. Replying here is what made the client the
+        // one role whose hello could lose a race with its own child's first write.
         break;
 
     case MSG_DATA_STDIN:
@@ -1612,8 +1612,27 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     XifHoldRelease(TRUE);
 }
 
+// HELLO ORDER. Both roles send MSG_HELLO here, and this function fails if it cannot, so our hello
+// is on the wire before wmain creates the child or its output pumps.
+//
+// It used to be the server's job only. The client left its hello to EventLoop, which it reaches
+// AFTER the child and both pumps are running, and the pumps send without consulting the handshake.
+// MEASURED 2026-10-26 (campaign d35b65e8ccbc, win11-reinstall), the caller's rejection:
+//   qrexec-agent-data.c:119:handle_handshake: Invalid HELLO packet received: type 401, len 43
+// 401 = 0x191 = MSG_DATA_STDOUT (qubes-core-qrexec 4.3.14, qrexec/tests/socket/qrexec.py:27) and 43
+// bytes is cmd.exe's banner: the child's first write reached the peer where our hello belonged, and
+// a campaign aborted at cell 6 of 8 on it. Likely trigger, UNMEASURED: a493b63 pins qrexec to one
+// CPU and children inherit the mask, so the pumps and EventLoop contend for one vCPU.
+//
+// Sending unprompted is the protocol's own shape, not a shortcut: the data handshake is symmetric -
+// each side sends its hello and then reads the peer's (qrexec/tests/socket/qrexec.py:100-104
+// handshake(): send_message(MSG_HELLO) then recv_message(); daemon.py:229-231 the same). Treating it
+// as a reply is what made the client the one role whose hello could lose a race.
+//
+// The ordering is therefore structural - there is no send path to guard, no gate for a teardown to
+// release, and no second place that has to agree.
 /**
- * @brief Create data vchan connection to the remote peer. Send MSG_HELLO if acting as server.
+ * @brief Create data vchan connection to the remote peer. Send MSG_HELLO in either role.
  * @param domain Remote vchan domain.
  * @param port Remote vchan port.
  * @param isServer Determines if we're acting as the vchan server.
@@ -1671,6 +1690,18 @@ libvchan_t *InitVchan(
             // miss and wait again. At DEBUG. This is the whole of what this change makes quieter:
             // the stray ERROR lines a SUCCESSFUL connect to a slow peer writes today.
             XifHoldRelease(TRUE);
+
+            // AND OUR HELLO GOES OUT HERE, exactly as the server branch above sends its own: before
+            // this function returns, so before wmain creates the child or its output pumps. See the
+            // HELLO ORDER note on this function.
+            if (!VchanSendHello(vchan))
+            {
+                LogError("VchanSendHello(%p) failed", vchan);
+                libvchan_close(vchan);
+                return NULL;
+            }
+
+            LogDebug("vchan %p: hello sent", vchan);
         }
         else
         {
@@ -1994,8 +2025,6 @@ int wmain(int argc, WCHAR *argv[])
     if (!child->Vchan)
         goto cleanup;
     InterlockedExchange(&g_VchanOpen, 1);
-    if (child->IsVchanServer)
-        child->HelloSent = TRUE; // InitVchan sent the server's hello (it fails otherwise)
 
     if (wcscmp(userName, L"(null)") == 0)
         userName = NULL;
@@ -2103,10 +2132,10 @@ cleanup:
                 // send "exit code" (creation status really) if the io isn't piped or child creation failed
                 if (!piped || status != ERROR_SUCCESS)
                 {
-                    // only if ours has not gone out yet - e.g. the child failed before the handshake; after data has
-                    // flowed (a console-control stop, an i/o error) a second hello would be a protocol error
-                    if (!child->HelloSent)
-                        VchanSendHello(child->Vchan);
+                    // No hello here, and no flag to consult. InitVchan sends ours in both roles
+                    // and returns NULL if it cannot, so reaching this block at all means it went
+                    // out. Exactly one hello, before the child exists, never after data - by
+                    // construction rather than by a check someone has to remember.
                     // SAY WHY, in words, before the number. A caller gets the exit code truncated to
                     // 8 bits (1326 arrives as 46), so a bare status tells a user nothing at all -
                     // which is exactly how a failed app-menu start became silent.
