@@ -2134,7 +2134,10 @@ cleanup:
 
         if (child->Vchan)
         {
-            if (libvchan_is_open(child->Vchan))
+            // RINGPEER: the peer's own liveness flag on entry to cleanup - findings/wedge.md bullet 12.
+            int peerAtCleanup = libvchan_is_open(child->Vchan);
+
+            if (peerAtCleanup)
             {
                 // send "exit code" (creation status really) if the io isn't piped or child creation failed
                 if (!piped || status != ERROR_SUCCESS)
@@ -2167,6 +2170,16 @@ cleanup:
             // that lock (VchanSendData) - so it finishes its send before this close or finds NULL after it, and never
             // touches a ring being unmapped. A pump waiting for room when the peer has stopped reading gives up on
             // g_VchanClosing within one poll, so taking the lock here never waits on the peer.
+
+            // Three literals, not one with a number: log-sweep's normalize() maps every digit to N,
+            // so a state=%d line would collapse all three outcomes into ONE signature and count nothing.
+            // INFO on purpose: the sweep gate reads [WE] only, so this costs no gate budget.
+            if (peerAtCleanup == VCHAN_CONNECTED)
+                LogInfo("RINGPEER peer still connected on entry to cleanup");
+            else if (peerAtCleanup == VCHAN_WAITING)
+                LogInfo("RINGPEER peer waiting on entry to cleanup");
+            else
+                LogInfo("RINGPEER peer disconnected on entry to cleanup");
             InterlockedExchange(&g_VchanClosing, 1);
             EnterCriticalSection(&g_VchanCs);
             libvchan_close(child->Vchan);
