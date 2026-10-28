@@ -453,7 +453,28 @@ static BOOL QwWaitForInteractiveLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUs
         if (waited % 10000 == 0)
             LogDebug("waiting for interactive logon (%lu of %lu ms)", waited, timeoutMs);
 
-        Sleep(step);
+        // A STOP MUST NOT WAIT OUT NINETY SECONDS. This poll is reached only AFTER the vchan is
+        // open - wmain opens it and sets g_VchanOpen, and only then calls StartChild, which calls
+        // this - so a console CTRL_CLOSE/CTRL_SHUTDOWN arriving here used to be ignored for up to
+        // 90 s. WrapperCtrlHandler gives the main thread CTRL_CLOSE_WAIT_MS to reach the close and
+        // then ExitProcess()es, so the ring is torn down by exit-time kernel cleanup on a thread
+        // that is not ours - exactly the path the always-close in wmain's cleanup exists to avoid.
+        // Measured shape this covers: a cold qube where dom0's app-menu launch arrives before the
+        // logon, and the qube is then halted (or an installer's Restart Manager sends the signal)
+        // while this is still polling.
+        // Waiting ON the stop costs nothing when none comes - the timeout is the same 1 s sleep.
+        if (g_StopEvent)
+        {
+            if (WaitForSingleObject(g_StopEvent, step) == WAIT_OBJECT_0)
+            {
+                LogWarning("interactive logon wait abandoned after %lu ms of %lu - stop signalled", waited, timeoutMs);
+                return FALSE;
+            }
+        }
+        else
+        {
+            Sleep(step);
+        }
         waited += step;
     }
 }
@@ -1236,12 +1257,23 @@ DWORD WINAPI StderrThread(
 // So the sink becomes CONNECT-AWARE: while the client connect runs, library records are HELD
 // instead of printed, and the outcome decides what to do with them. Two rules keep this from being
 // a suppression:
-//   * NOTHING IS DESTROYED - every held record is replayed in every branch, at DEBUG when the
-//     outcome was ordinary and at its ORIGINAL level when it was not, so raising the wrapper's
-//     LogLevel reproduces today's output verbatim;
-//   * QUIET REQUIRES TWO AGREEING POSITIVE DETECTIONS. If the held buffer overflowed, if the
-//     detectors disagree, or if the probe returns anything unexpected, the loud replay is the
-//     default. The absence of evidence never buys silence.
+//   * NOTHING IS DESTROYED - every held record is replayed in every branch, so raising the
+//     wrapper's LogLevel reproduces today's output verbatim;
+//   * QUIET REQUIRES TWO AGREEING POSITIVE DETECTIONS. The absence of evidence never buys silence.
+//     This rule still governs - five separate attempts to make this path quieter were refused on
+//     it, and the refusals are recorded at the XifHoldReleaseCollapsed call site below.
+// WHAT THIS BLOCK USED TO CLAIM, AND DID NOT DO [corrected 2026-10-28]. The first bullet used to
+// end "at DEBUG when the outcome was ordinary and at its ORIGINAL level when it was not", and the
+// second used to add "if the held buffer overflowed, if the detectors disagree, or if the probe
+// returns anything unexpected, THE LOUD REPLAY IS THE DEFAULT". There was no loud replay. Both
+// call sites of XifHoldRelease passed quiet=TRUE and no call site anywhere passed FALSE, so the
+// original-level branch was unreachable from the day it was written; the parameter is now gone.
+// The code is kept and the prose corrected rather than the reverse, because what the FAILURE path
+// actually does is better than what was claimed for it: XifHoldReleaseCollapsed emits ONE dense
+// ERROR line naming the peer, the port and the decisive records - measured on the 19709 specimen,
+// "5/8 records: ... failed to read '.../ring-ref' from store: 0x5 | libxenvchan_client_init(...)
+// failed" - and the full sequence still replays at DEBUG. One line that says what happened beats
+// twenty that have to be reassembled.
 // MEASURED ON A GUEST 2026-10-09, which is how this number was chosen rather than guessed: at
 // LogLevel 4 a client connect emits 20 records on the failing path and 27 on the succeeding one, so
 // a 16-slot hold overflowed on EVERY connect - and because the hold is first-come-first-served, what
@@ -1289,9 +1321,10 @@ static void XifLogger(int level, const char *function, const WCHAR *format, va_l
     _LogFormat(level, FALSE, function, L"%s", buf);
 }
 
-// Replay every held record. quiet=TRUE puts them at DEBUG (the outcome was ordinary); quiet=FALSE
-// restores each record's ORIGINAL level, which is exactly what the log looked like before.
-static void XifHoldRelease(BOOL quiet)
+// Replay every held record at DEBUG. There is no second mode: the `quiet` parameter this used to
+// take was TRUE at both call sites and FALSE at none, so its other half was unreachable code
+// describing an intent (see the corrected block above). Removed 2026-10-28.
+static void XifHoldRelease(void)
 {
     g_XifHoldOn = FALSE;
     for (ULONG i = 0; i < g_XifHoldCount; i++)
@@ -1300,7 +1333,7 @@ static void XifHoldRelease(BOOL quiet)
         // "%s", text - NEVER text as the format. _LogFormat is printf-style and the held text is
         // ALREADY formatted (XifLogger ran StringCbVPrintfW before storing it), so passing it as a
         // format would make any '%' in a library message read garbage off the varargs.
-        _LogFormat(quiet ? LOG_LEVEL_DEBUG : r->level, FALSE,
+        _LogFormat(LOG_LEVEL_DEBUG, FALSE,
                    r->function[0] ? r->function : NULL, L"%s", r->text);
     }
     if (g_XifHoldLost)
@@ -1310,13 +1343,10 @@ static void XifHoldRelease(BOOL quiet)
         // the records were going to DEBUG anyway, so an overflow costs replay detail and nothing
         // else. It was measured firing on every successful connect at LogLevel 4. The failing path
         // reports its own overflow INSIDE the one error line, where it changes what the line means,
-        // and clears the counter before it gets here.
-        if (quiet)
-            LogDebug("%lu record(s) past %d not replayed; connect succeeded",
-                     g_XifHoldLost, XIFHOLD_MAX);
-        else
-            LogWarning("%lu record(s) past %d dropped",
-                       g_XifHoldLost, XIFHOLD_MAX);
+        // and clears the counter before it gets here - so only a SUCCESSFUL connect arrives here
+        // with an overflow, and the LogWarning arm this used to have went with `quiet`.
+        LogDebug("%lu record(s) past %d not replayed; connect succeeded",
+                 g_XifHoldLost, XIFHOLD_MAX);
     }
     g_XifHoldCount = 0;
     g_XifHoldLost = 0;
@@ -1616,7 +1646,7 @@ static void XifHoldReleaseCollapsed(int domain, int port)
     _LogFormat(LOG_LEVEL_ERROR, FALSE, "InitVchan", L"%s", line);
 
     // ...then the library's own sequence at DEBUG, which also clears the hold and its counters.
-    XifHoldRelease(TRUE);
+    XifHoldRelease();
 }
 
 // HELLO ORDER. Both roles send MSG_HELLO here, and this function fails if it cannot, so our hello
@@ -1696,7 +1726,7 @@ libvchan_t *InitVchan(
             // then succeeded - including the existence probe whose own comment says it expects to
             // miss and wait again. At DEBUG. This is the whole of what this change makes quieter:
             // the stray ERROR lines a SUCCESSFUL connect to a slow peer writes today.
-            XifHoldRelease(TRUE);
+            XifHoldRelease();
 
             // AND OUR HELLO GOES OUT HERE, exactly as the server branch above sends its own: before
             // this function returns, so before wmain creates the child or its output pumps. See the

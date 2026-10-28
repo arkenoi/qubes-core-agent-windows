@@ -1428,7 +1428,14 @@ static void XifLogger(int level, const char* function, const WCHAR* format, va_l
     WCHAR buf[1024];
 
     StringCbVPrintfW(buf, sizeof(buf), format, args);
-    _LogFormat(level, FALSE, function, buf);
+    // "%s", buf - NEVER buf as the format. _LogFormat is printf-style and buf is ALREADY formatted
+    // by the line above, so a library message carrying a literal '%' would read garbage off
+    // varargs that do not exist. The wrapper carried the identical defect and fixed it
+    // (qrexec-wrapper.c XifLogger); this is the sibling in the LONG-LIVED service, where the cost
+    // is worse - the agent dying takes qrexec out for the whole boot. Latent today (this sink is
+    // registered for the control-vchan connect only, whose text is device paths, xenstore key
+    // names built from local domain/port numbers, and numeric codes), which is why it survived.
+    _LogFormat(level, FALSE, function, L"%s", buf);
 }
 
 /**
