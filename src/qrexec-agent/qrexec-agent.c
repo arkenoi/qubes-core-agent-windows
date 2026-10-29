@@ -91,6 +91,15 @@ struct CLIENT_CONTEXT
 };
 
 #define MAX_FDS 128
+// Windowed-wait tuning. CONN_WAIT_WINDOW_MS is used ONLY when the live connection count exceeds
+// the MAXIMUM_WAIT_OBJECTS limit, so the ordinary path keeps its INFINITE wait and costs nothing.
+#define CONN_WAIT_WINDOW_MS                 200
+#define CONN_WAIT_FAILURE_BACKOFF_MS        50
+#define CONN_WAIT_MAX_CONSECUTIVE_FAILURES  200
+// Log throttles. Both states below recur every few tens of milliseconds, and the log sweep is a
+// release gate that counts warning and error lines - an unthrottled report fails it by itself.
+#define CONN_WAIT_WINDOW_LOG_EVERY          150
+#define CONN_WAIT_FAILURE_LOG_EVERY         50
 static struct _connection_info connection_info[MAX_FDS];
 
 // QdbDaemon reports RUNNING to the SCM before it has its vchan (db-daemon.c: "vchan is
@@ -326,24 +335,38 @@ cleanup:
     return status;
 }
 
-static void register_vchan_connection(HANDLE handle, int domain, int port)
+static DWORD register_vchan_connection(HANDLE handle, int domain, int port)
 {
+    int used = 0;
+
     AcquireSRWLockExclusive(&g_ConnectionsHandlesLock);
     for (int i = 0; i < MAX_FDS; i++)
     {
-        if (connection_info[i].handle == NULL)
+        if (connection_info[i].handle != NULL)
         {
-            LogVerbose("child %p, %d:%d", handle, domain, port);
-            connection_info[i].handle = handle;
-            connection_info[i].connect_domain = domain;
-            connection_info[i].connect_port = port;
-            ReleaseSRWLockExclusive(&g_ConnectionsHandlesLock);
-            return;
+            used++;
+            continue;
         }
+        LogVerbose("child %p, %d:%d", handle, domain, port);
+        connection_info[i].handle = handle;
+        connection_info[i].connect_domain = domain;
+        connection_info[i].connect_port = port;
+        ReleaseSRWLockExclusive(&g_ConnectionsHandlesLock);
+        return ERROR_SUCCESS;
     }
     ReleaseSRWLockExclusive(&g_ConnectionsHandlesLock);
-    LogError("No free slot for child %p (connection to %d:%d)", handle, domain, port);
-    // FIXME: error
+
+    // EXHAUSTION IS NOW A FAILURE, not a log line. This used to be `// FIXME: error`: the table
+    // was full, the caller was never told, and the wrapper ran UNTRACKED - its handle never
+    // entered the wait set, so release_connection could never run for it and dom0 never got its
+    // MSG_CONNECTION_TERMINATED. Returning the error makes the exec fail visibly on the one call
+    // that cannot be tracked, instead of silently degrading the whole subsystem.
+    // The handle is closed because nothing will ever wait on it; the process keeps running, which
+    // is the same as before - what changes is that we no longer leak the reference as well.
+    LogError("No free slot for child %p (connection to %d:%d) - %d of %d slots in use",
+        handle, domain, port, used, MAX_FDS);
+    CloseHandle(handle);
+    return ERROR_NO_MORE_ITEMS;
 }
 
 static void release_connection(int id)
@@ -918,7 +941,8 @@ static DWORD StartChild(int domain, int port, PWSTR userName, PWSTR commandLine,
     status = CreateNormalProcessAsCurrentUser(command, &wrapper);
     if (status == ERROR_SUCCESS)
     {
-        register_vchan_connection(wrapper, domain, port);
+        // Propagate: a connection we cannot track is a failed exec, not a silent success.
+        status = register_vchan_connection(wrapper, domain, port);
     }
     free(command);
     return status;
@@ -1253,6 +1277,15 @@ static DWORD WatchForEvents(HANDLE stopEvent)
     BOOL run = TRUE;
     BOOL daemonConnected = FALSE;
     HANDLE waitObjects[2 + MAX_FDS];
+    // Rotation cursor for the windowed wait below, and the consecutive-failure counter that keeps
+    // a persistent wait failure from becoming a tight spin.
+    int   waitScanStart = 0;
+    DWORD consecutiveWaitFailures = 0;
+    // Both noisy states are rate-limited: this loop can spin every CONN_WAIT_WINDOW_MS while
+    // windowed, and the log sweep is a release gate that counts [WE] lines. An unthrottled
+    // warning here would emit several per second and fail the gate on its own.
+    DWORD windowedPasses = 0;
+    BOOL  wasWindowed = FALSE;
     HANDLE advertiseToolsProcess;
     WCHAR advertiseCommand[] = L"advertise-tools.exe 1"; // must be non-const
 
@@ -1293,26 +1326,108 @@ static DWORD WatchForEvents(HANDLE stopEvent)
 
         status = ERROR_SUCCESS;
 
-        DWORD waitObjectsIndex = 2;
-        // add registered processes's handles to watch
+        // THE WAIT SET IS CAPPED AT THE API LIMIT. WaitForMultipleObjects fails outright with
+        // ERROR_INVALID_PARAMETER when nCount exceeds MAXIMUM_WAIT_OBJECTS (64), and this array is
+        // 2 + MAX_FDS = 130 entries: every connection handle was added unconditionally, so from the
+        // 63rd simultaneously-registered connection onward the call COULD NOT SUCCEED, and the
+        // WAIT_FAILED arm below then broke out of this loop - the agent stopped servicing qrexec
+        // for the life of the service, on a guest that was otherwise healthy. A wedged wrapper
+        // makes that reachable by accumulation rather than concurrency: release_connection is the
+        // only writer that clears a handle and it runs when the wrapper PROCESS exits, so a wrapper
+        // blocked in libvchan_close holds its slot forever.
+        //
+        // Below the limit NOTHING CHANGES - same handles, same INFINITE wait. Only when the set
+        // would overflow do we wait on a rotating window with a bounded timeout, advancing the
+        // cursor each pass so no connection is starved of attention.
+        int liveConnections = 0;
         for (int i = 0; i < MAX_FDS; i++)
         {
+            if (connection_info[i].handle != NULL)
+                liveConnections++;
+        }
+
+        DWORD waitObjectsIndex = 2;
+        int slotsExamined = 0;
+        // add registered processes's handles to watch
+        for (int n = 0; n < MAX_FDS && waitObjectsIndex < MAXIMUM_WAIT_OBJECTS; n++)
+        {
+            int i = (waitScanStart + n) % MAX_FDS;
+            slotsExamined = n + 1;
             if (connection_info[i].handle != NULL)
             {
                 waitObjects[waitObjectsIndex++] = connection_info[i].handle;
             }
         }
+
+        const BOOL windowed = (liveConnections > (int)(MAXIMUM_WAIT_OBJECTS - 2));
+        if (windowed)
+        {
+            // ON ENTRY, then at most once per CONN_WAIT_WINDOW_LOG_EVERY passes. This is a state
+            // the guest should never be in and it is the only visible sign that connections are
+            // accumulating toward the ceiling - but it recurs every CONN_WAIT_WINDOW_MS, so an
+            // unthrottled line would be several warnings a second and would fail the log sweep.
+            if (!wasWindowed || (windowedPasses % CONN_WAIT_WINDOW_LOG_EVERY) == 0)
+            {
+                LogWarning("connection wait set windowed: %d live connections exceed the %d-handle wait limit",
+                    liveConnections, (int)MAXIMUM_WAIT_OBJECTS - 2);
+            }
+            windowedPasses++;
+            // ADVANCE BY THE SLOTS ACTUALLY EXAMINED, not by the handle capacity. The table is
+            // sparse - 128 slots holding however many live connections - so collecting 62 handles
+            // can span far more than 62 slots. Advancing by the capacity would re-cover ground
+            // this pass already walked and leave connections at the far end of the table never
+            // waited on. Starting the next pass where this one stopped makes the rotation cover
+            // the whole table exactly once per cycle whatever the occupancy.
+            waitScanStart = (waitScanStart + slotsExamined) % MAX_FDS;
+        }
+        else
+        {
+            windowedPasses = 0;
+        }
+        wasWindowed = windowed;
+
         LogVerbose("waiting for event");
 
-        signaledEvent = WaitForMultipleObjects(waitObjectsIndex, waitObjects, FALSE, INFINITE) - WAIT_OBJECT_0;
+        signaledEvent = WaitForMultipleObjects(waitObjectsIndex, waitObjects, FALSE,
+                                               windowed ? CONN_WAIT_WINDOW_MS : INFINITE) - WAIT_OBJECT_0;
 
         LogVerbose("event %d", signaledEvent);
 
+        if (WAIT_TIMEOUT == signaledEvent)
+        {
+            // Only reachable in the windowed case: rotate to the next slice of the handle set.
+            continue;
+        }
+
         if (WAIT_FAILED == signaledEvent)
         {
-            status = win_perror("WaitForMultipleObjects");
-            break;
+            // DO NOT BREAK. This used to exit the loop on ANY wait failure, which turned a single
+            // bad or stale handle - and, before the cap above, simply having too many connections -
+            // into a permanently unresponsive qrexec on a healthy guest. Degrade instead: report
+            // it, back off briefly so a persistent failure cannot spin a core, and re-derive the
+            // wait set on the next pass, which is what drops a handle that has gone bad.
+            // First failure loudly, then throttled: the backoff is CONN_WAIT_FAILURE_BACKOFF_MS,
+            // so reporting every pass would put hundreds of ERROR lines into the sweep budget for
+            // one stuck condition. The give-up line below always prints.
+            if (consecutiveWaitFailures == 0 ||
+                (consecutiveWaitFailures % CONN_WAIT_FAILURE_LOG_EVERY) == 0)
+            {
+                win_perror("WaitForMultipleObjects");
+            }
+            consecutiveWaitFailures++;
+            if (consecutiveWaitFailures >= CONN_WAIT_MAX_CONSECUTIVE_FAILURES)
+            {
+                // Still bounded: if it never recovers, fail the service for real rather than
+                // logging forever, so the SCM's failure actions can restart us.
+                LogError("WaitForMultipleObjects failed %lu times in a row, giving up",
+                    consecutiveWaitFailures);
+                status = ERROR_INVALID_FUNCTION;
+                break;
+            }
+            Sleep(CONN_WAIT_FAILURE_BACKOFF_MS);
+            continue;
         }
+        consecutiveWaitFailures = 0;
 
         if (0 == signaledEvent) // stop event
         {
