@@ -1839,6 +1839,15 @@ DWORD EventLoop(
                         g_DataErrorStatus = status;
                     g_exitReason = EXIT_REASON_DATA_ERROR;
                     run = FALSE;
+                    // BREAK, like the other two copies of this loop. Without it the loop keeps
+                    // calling HandleDataMessage after a failure and `status` is REASSIGNED each
+                    // pass, so a later pass returning ERROR_SUCCESS overwrites the failure and
+                    // wmain sees success while g_exitReason says EXIT_REASON_DATA_ERROR - and the
+                    // `status != ERROR_SUCCESS` arm in cleanup then never reports it to the peer.
+                    // It also re-reads a stream left desynchronised by the oversize-chunk arm,
+                    // which consumes a header and leaves the payload. The drain loop and the
+                    // no-child loop both break here; this copy was the one that did not.
+                    break;
                 }
             }
             break;
@@ -2115,7 +2124,18 @@ int wmain(int argc, WCHAR *argv[])
         {
             if (child->Vchan)
             {
+                // SAME DISCIPLINE AS THE MAIN CLEANUP, which this branch used to skip entirely.
+                // A bare close here left g_VchanClosing at 0 and g_VchanOpen at 1 over a vchan that
+                // is gone, so a console-control event arriving afterwards took the "cleanup never
+                // reached the close" arm and logged an ERROR about a close that had completed -
+                // wrong, and in the direction the log sweep counts. Taking g_VchanCs also matches
+                // the invariant every send relies on: child->Vchan is read under that lock.
+                InterlockedExchange(&g_VchanClosing, 1);
+                EnterCriticalSection(&g_VchanCs);
                 libvchan_close(child->Vchan);
+                child->Vchan = NULL;
+                InterlockedExchange(&g_VchanOpen, 0);
+                LeaveCriticalSection(&g_VchanCs);
             }
             free(child);
             child = NULL;
