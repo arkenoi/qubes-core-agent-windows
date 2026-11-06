@@ -536,9 +536,22 @@ NTSTATUS FileDelete(IN HANDLE file)
 
         if (!NT_SUCCESS(status))
         {
-            NtLog(TRUE, L"[!] FileDelete: FSCTL_DELETE_REPARSE_POINT failed: %x\n", status);
-            if (rdb->ReparseTag != IO_REPARSE_TAG_APPEXECLINK)
-            goto cleanup;
+            // An app execution alias - every *.exe under AppData\Local\Microsoft\WindowsApps - refuses
+            // FSCTL_DELETE_REPARSE_POINT with STATUS_ACCESS_DENIED, and we carry on DELIBERATELY: the
+            // delete disposition below removes the file regardless. Logging that at [!], this writer's
+            // error marker, made a by-design outcome the loudest thing in the file: 8 lines on every
+            // Win10 install and 30 on every Win11 install of the 4.3.39 campaign, all of them this tag
+            // (measured: every failing line carried EA: 8000001b). The non-tolerated case is unchanged,
+            // and the goto is now braced - it sat under an unbraced if, indented as if unconditional.
+            if (rdb->ReparseTag == IO_REPARSE_TAG_APPEXECLINK)
+            {
+                NtLog(FALSE, L"[*] FileDelete: app execution alias keeps its reparse point (%x), deleting the file anyway\n", status);
+            }
+            else
+            {
+                NtLog(TRUE, L"[!] FileDelete: FSCTL_DELETE_REPARSE_POINT failed: %x\n", status);
+                goto cleanup;
+            }
         }
     }
 
