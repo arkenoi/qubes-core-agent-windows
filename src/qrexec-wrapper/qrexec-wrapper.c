@@ -467,7 +467,13 @@ static BOOL QwWaitForInteractiveLogon(_In_ DWORD timeoutMs, _Out_writes_z_(cchUs
         {
             if (WaitForSingleObject(g_StopEvent, step) == WAIT_OBJECT_0)
             {
-                LogWarning("interactive logon wait abandoned after %lu ms of %lu - stop signalled", waited, timeoutMs);
+                // A STOP WE WERE SIGNALLED IS NOT A FAULT. ADR-supervision section 7: an alert for a
+                // condition that was REQUESTED is never actionable. This branch's own condition IS the
+                // stop, so there is nothing to read at runtime and no predicate to call - the level is
+                // the whole fix. Jev scored this degrade_when_going_down 0.87 over stays_loud in the
+                // going-down audit (tools/msg-audit.py goingdown, 2026-11-07), the only above-floor
+                // governed site outside the agent.
+                LogInfo("QGAGOINGDOWN interactive logon wait abandoned after %lu ms of %lu - stop signalled", waited, timeoutMs);
                 return FALSE;
             }
         }
@@ -724,7 +730,12 @@ static BOOL VchanWaitForSendSpace(
         }
         if (g_VchanClosing)
         {
-            LogWarning("the vchan is being closed while %Iu bytes waited for room - not sent", size);
+            // OUR OWN CLOSE IS THIS BRANCH'S CONDITION (g_VchanClosing), so ADR-supervision 7
+            // applies statically and there is nothing to read at runtime - the level is the fix.
+            // The SIBLING above is not this case: there the PEER closed the vchan, which nobody
+            // here requested: Jev returned insufficient_evidence 0.51 there and scored THIS one
+            // degrade_when_going_down 0.96, the highest in the audit.
+            LogInfo("QGAGOINGDOWN the vchan is being closed while %Iu bytes waited for room - not sent", size);
             return FALSE;
         }
         Sleep(1);
