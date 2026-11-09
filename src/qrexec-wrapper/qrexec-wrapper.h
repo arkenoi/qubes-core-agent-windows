@@ -43,9 +43,20 @@
 #define DATA_PROTOCOL_VERSION   4   // v4 on the data vchan is v3 there (64 KiB chunks); 4 for consistency with upstream
 #define MAX_DATA_CHUNK_V3       65536
 // What this side SENDS stays at MAX_DATA_CHUNK (4 KiB) under either version - v3 only raises the MAXIMUM a
-// chunk may be. Measured 2026-09-29 (interleaved, 3 rounds, Windows 11): with 32 KiB sends, copy OUT of the guest
-// fell (median 51 -> 28 MB/s), because each send is all-or-nothing and waits for a ring gap the size of the WHOLE
-// chunk by polling with Sleep(1). Receiving up to 64 KiB is where the gain is (copy IN median 55 -> 94 MB/s).
+// chunk may be. Receiving up to 64 KiB while sending 4 KiB is the amended shape (44368a2), under which copy-out
+// cannot regress by construction, because each send is all-or-nothing and waits for a ring gap the size of the
+// WHOLE chunk.
+// NO THROUGHPUT NUMBER BELONGS IN THIS FILE. The 2026-09-29 A/B's figures stood here as measured fact and are
+// RETRACTED - findings/qrexec.md owns that record and the reason: the CONTROL's own copy-in ranged 40-106 MB/s
+// and rose round over round, every round ran control first, and a counterbalanced re-run separated nothing.
+// Quoting them from here has already produced one wrong argument. What stands is the SOURCE fact: Windows
+// announced v2 (4 KiB chunks) where dom0 uses 64 KiB, and the data-vchan v3 change removes that.
+// OWNER, 2026-11-09, on a proposal to SHRINK this geometry to save grant pages: «yet we still want up to date
+// qrexec protocol and large buffers like linux counterpart does. measure later.» So the current protocol and
+// the large buffers STAY, and nothing here is traded for grants. The one remaining gap to that parity is this
+// side's 4 KiB SEND against dom0's 64 KiB; it is not closed here because the measurement is deferred and the
+// instrument does not exist - tools/bench-stock-vs-ours.sh measures guest CPU, not copy throughput, and a valid
+// one needs source on tmpfs, counterbalanced order and control stability shown first.
 
 typedef enum _PIPE_TYPE
 {

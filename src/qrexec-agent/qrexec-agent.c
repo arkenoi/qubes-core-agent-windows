@@ -310,6 +310,25 @@ BOOL VchanSendMessage(
     header.len = cbData;
     EnterCriticalSection(&g_DaemonCriticalSection);
 
+    // TOCTOU, and the reason ordering the close under this lock is not sufficient by itself: every
+    // caller evaluates g_DaemonVchan BEFORE this acquisition (:382, :1774, and VchanSendHello's
+    // argument at :1447), so between that read and this line ServiceCleanup can have taken the lock,
+    // closed the ring and NULLed the global - leaving `vchan` a dangling NON-NULL pointer that the
+    // assert above passes without complaint. The lock protects the global, never a copy taken outside
+    // it, so the global is the authority and it is only stable in here. qrexec-wrapper holds the same
+    // rule the same way: VchanSendData reads child->Vchan under g_VchanCs instead of trusting a copy.
+    // Every call reaches here with g_DaemonVchan, so an inequality means the vchan was torn down under
+    // this call and touching it would be the use-after-unmap.
+    // BOTH halves are needed. A caller that read the global BEFORE the close holds a stale non-NULL
+    // pointer (second half); one that read it AFTER holds NULL, and NULL != NULL is false, so without
+    // the first half that caller would pass this check and hand NULL to VchanGetWriteBufferSize. The
+    // assert above does not cover it - asserts compile out of the shipped build.
+    if (!g_DaemonVchan || g_DaemonVchan != vchan)
+    {
+        LogInfo("QGAGOINGDOWN the daemon vchan was closed before %u byte(s) of %s could be sent", cbData, what);
+        goto cleanup;
+    }
+
     if (!VchanSendBuffer(vchan, &header, sizeof(header), L"header"))
     {
         LogError("VchanSendBuffer(header for %s) failed", what);
@@ -1983,11 +2002,27 @@ DWORD WINAPI ServiceExecutionThread(void* param)
 
 static DWORD WINAPI ServiceCleanup(void)
 {
+    // THE ORDER IS THE WHOLE FIX. This closed and cleared g_DaemonVchan under NO lock, while a pipe
+    // thread can be inside VchanSendMessage holding g_DaemonCriticalSection across the send (:311-334)
+    // and parked in winutils' wait for ring room. It runs on the service thread BEFORE the pipe server
+    // is joined - ServiceExecutionThread calls this, and only then waits 1 s and TerminateThread()s,
+    // with its own FIXME that the pipe server has no graceful stop - so the close races a live sender
+    // by construction, not by luck. That is the use-after-unmap qrexec-wrapper fixed for itself in
+    // 1df5a7b (2026-09-30) and this component never got.
+    //
+    // Announce the teardown FIRST and UNLOCKED: that is what releases a sender parked in the shared
+    // wait (it returns FALSE and leaves the critical section), so taking the lock below cannot block
+    // on it. Taking the lock without announcing first would merely trade a use-after-unmap for a
+    // service that never stops. Jev scored this shape both_legs 0.95.
+    VchanBeginTeardown();
+
+    EnterCriticalSection(&g_DaemonCriticalSection);
     if (g_DaemonVchan)
     {
         libvchan_close(g_DaemonVchan);
         g_DaemonVchan = NULL;
     }
+    LeaveCriticalSection(&g_DaemonCriticalSection);
     return ERROR_SUCCESS;
 }
 
