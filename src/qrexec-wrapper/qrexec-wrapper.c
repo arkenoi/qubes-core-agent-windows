@@ -24,6 +24,7 @@
 // It's role is communication with the data vchan peer and handling child program's I/O.
 
 #include "qrexec-wrapper.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <shlwapi.h>
@@ -719,6 +720,17 @@ static BOOL VchanWaitForSendSpace(
     _In_ const PWSTR what
     )
 {
+    // NO EXIT HERE FOR "THE RING CANNOT HOLD size AT ALL": this waits for room, for the peer's close,
+    // or for our own, and for nothing else - so a ring smaller than the largest message
+    // VchanSendMessage can ask for is not slow, it HANGS, spinning the Sleep(1) below with g_VchanCs
+    // held until the peer hangs up. The largest ask is sizeof(msg_header) + MAX_DATA_CHUNK = 4104:
+    // the output pump reads at most MAX_DATA_CHUNK, and every other sender here is smaller
+    // (g_FailureText is 512, the hello and the exit code a few bytes). The floor is a BUILD error so
+    // that shrinking VCHAN_BUFFER_SIZE to save grants - 65536 per direction costs 33 - cannot
+    // reintroduce it silently.
+    static_assert(VCHAN_BUFFER_SIZE >= sizeof(struct msg_header) + MAX_DATA_CHUNK,
+                  "VCHAN_BUFFER_SIZE below sizeof(msg_header) + MAX_DATA_CHUNK makes this wait unsatisfiable");
+
     if (VchanGetWriteBufferSize(vchan) < (int)size)
         LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
     while (VchanGetWriteBufferSize(vchan) < (int)size)
