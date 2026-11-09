@@ -47,6 +47,18 @@
 
 libvchan_t* g_DaemonVchan;
 
+// ROOM IN THE DAEMON SEND RING, SIGNALLED BY THE MAIN LOOP. Auto-reset, created before the vchan and
+// never closed (the service's process exits), so a sender never waits on a handle another thread can
+// close. Same change, same reason, as qrexec-wrapper.c's g_VchanRoomEvent - see the comment there.
+//
+// Short version: libvchan_fd_for_select hands back the vchan's OWN event, which is auto-reset and so
+// releases exactly ONE waiter, and it carries incoming data, the daemon's consume and the close all
+// on one object. With senders waiting on it directly - the pipe-server threads, the trigger path and
+// the hello - the main loop takes wakes meant for them and hands nothing back. Only the main loop
+// waits on it now; senders wait here. Auto-reset is required: a manual-reset event nobody resets
+// stays signalled and a sender would wake, find no room and spin.
+static HANDLE g_VchanRoomEvent = NULL;
+
 CRITICAL_SECTION g_DaemonCriticalSection;
 CRITICAL_SECTION g_RequestCriticalSection;
 SRWLOCK g_ConnectionsHandlesLock;
@@ -354,13 +366,12 @@ BOOL VchanSendMessage(
     if (cbData > 0)
         CopyMemory(frame + sizeof(header), data, cbData);
 
-    HANDLE vchanEvent = NULL;   // a DUPLICATE this call owns; see the first-miss branch below
-    BOOL consumedWake = FALSE;
     BOOL blocked = FALSE;
-    BOOL handBack = TRUE;
     // HOW THE WAIT ENDED, on the exit line below: a duration cannot separate a wake lost to the main
     // loop from a daemon that really took the slice. Same counters as qrexec-wrapper.c's site, where
-    // the measurement that raised the question was taken.
+    // the measurement that raised the question was taken - and where two of three full-ring stalls
+    // in supervision run 20261109T193803Z ended on a slice timeout rather than a wake, which is what
+    // g_VchanRoomEvent below exists to stop.
     ULONG wakes = 0;
     ULONG slices = 0;
 
@@ -387,8 +398,6 @@ BOOL VchanSendMessage(
         if (!g_DaemonVchan || g_DaemonVchan != vchan)
         {
             LogInfo("QGAGOINGDOWN the daemon vchan was closed before %u byte(s) of %s could be sent", cbData, what);
-            // No wake handed back: the event belonged to a ring that has just been torn down.
-            handBack = FALSE;
             goto cleanup;
         }
 
@@ -404,28 +413,11 @@ BOOL VchanSendMessage(
 
         if (!blocked)
         {
-            HANDLE raw;
-
             blocked = TRUE;
             // INFO, not WARNING: the wait below releases g_DaemonCriticalSection, so a full ring delays
             // this sender alone. Same reasoning as qrexec-wrapper.c's identical site.
             LogInfo("ring full (need %Iu, free %d) - waiting for the daemon to drain before sending "
                 L"%s, WITHOUT g_DaemonCriticalSection", frameSize, VchanGetWriteBufferSize(vchan), what);
-            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
-            // handle, and libvchan_close closes it - which, now that the wait below runs with the lock
-            // OFF, can happen while this thread is blocked on it. Waiting on a handle another thread
-            // closes is undefined: the value can be recycled by the next CreateEvent and the wait would
-            // then take a wake belonging to an unrelated object. A duplicate keeps the kernel object
-            // alive for exactly as long as this call needs it, and SetEvent on the duplicate still
-            // signals the same object, so the hand-back below still reaches the loops waiting on the
-            // original. A failed duplicate degrades to the plain sleep, same as no event at all.
-            raw = libvchan_fd_for_select(vchan);
-            if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(), &vchanEvent,
-                                         0, FALSE, DUPLICATE_SAME_ACCESS))
-            {
-                vchanEvent = NULL;
-                LogWarning("no vchan event to wait on, polling for room instead");
-            }
         }
 
         // QRSENDLOCK. This lock orders writes into the ring; it is not what makes the wait correct.
@@ -437,18 +429,28 @@ BOOL VchanSendMessage(
         // yet: a sender admitted meanwhile writes a COMPLETE frame, and this pass re-reads the global,
         // the ring and the peer from scratch when it gets back in.
         LeaveCriticalSection(&g_DaemonCriticalSection);
-        if (vchanEvent)
         {
-            // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
-            // VCHAN_NOTIFY_READ BEFORE it reads the space, so the daemon's next consume fires this
-            // event. It is the same auto-reset event the main loop waits on for INCOMING data (:1369),
-            // so a wake taken here is handed back on every exit. ONLY THAT DIRECTION IS HANDLED: the
-            // event is auto-reset, so it releases ONE waiter, and the main loop hands nothing back -
-            // a wake meant for this thread can be consumed there and this wait runs to its slice.
-            DWORD w = WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS);
+            // NO WAKE IS LOST BETWEEN THE MAIN LOOP AND A SENDER, which is the fix. This thread no
+            // longer waits on the vchan's event at all, so it cannot take a wake meant for the main
+            // loop and the main loop cannot take one meant for it.
+            //
+            // THE CHECK-TO-WAIT WINDOW IS COVERED BY THE EVENT'S STATE, exactly as at
+            // qrexec-wrapper.c's site, which carries the full argument: VchanGetWriteBufferSize arms
+            // VCHAN_NOTIFY_READ before it reads the space, and a relay that lands between that check
+            // and this wait has already left this auto-reset event signalled, so the wait returns at
+            // once. A condition variable would not be correct here - it stores nothing, so a WakeAll
+            // in that window is lost unless the main loop signals under g_DaemonCriticalSection.
+            //
+            // WHAT IS STILL NOT COVERED, AND IT IS NOT CLAIMED TO BE: an auto-reset event releases ONE
+            // waiter, and this agent can have several senders blocked at once (the pipe-server
+            // threads, the trigger path, the hello). One relay frees one of them; the others run to
+            // their slice although there is room. Bounded by the slice, measured by the counters
+            // below, and strictly better than losing the wake to a reader that never hands it back.
+            // Manual-reset is not the answer: a sender would wake, find no room, loop and return
+            // instantly on the still-signalled event - the full-speed spin the guard below prevents.
+            DWORD w = WaitForSingleObject(g_VchanRoomEvent, VCHAN_SEND_WAIT_SLICE_MS);
             if (w == WAIT_OBJECT_0)
             {
-                consumedWake = TRUE;
                 wakes++;
             }
             else if (w == WAIT_TIMEOUT)
@@ -461,10 +463,6 @@ BOOL VchanSendMessage(
                 // churns g_DaemonCriticalSection every pass. Guard from agent/gui-agent/vchan.c:305.
                 Sleep(VCHAN_SEND_WAIT_SLICE_MS);
             }
-        }
-        else
-        {
-            Sleep(1);
         }
     }
 
@@ -483,12 +481,10 @@ BOOL VchanSendMessage(
     status = TRUE;
 
 cleanup:
-    if (vchanEvent)
-    {
-        if (consumedWake && handBack)
-            SetEvent(vchanEvent);
-        CloseHandle(vchanEvent);
-    }
+    // NOTHING TO UNDO HERE ANY MORE: this used to own a DuplicateHandle of the vchan's event and hand
+    // a consumed wake back, because it waited on an object the main loop also waited on and one that
+    // libvchan_close could close underneath it. g_VchanRoomEvent has no other waiter and nothing
+    // closes it, so there is no borrowed wake to return and no handle to release.
     LeaveCriticalSection(&g_DaemonCriticalSection);
     free(frame);
     return status;
@@ -1466,6 +1462,13 @@ static DWORD WatchForEvents(HANDLE stopEvent)
     // the boot. Launch them only once qubesdb is known to answer.
     ProcessAutostarts();
 
+    // BEFORE THE VCHAN EXISTS, because every send on it waits here and the hello is already a sender.
+    // Fatal, not degraded: keeping the branch out of the send path is half the point of the change,
+    // and a process that cannot create one event at startup is out of handles anyway.
+    g_VchanRoomEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_VchanRoomEvent)
+        return win_perror("CreateEvent(send-room)");
+
     // We give a 5 minute timeout here because xeniface can take some time
     // to load the first time after reboot after pvdrivers installation.
     g_DaemonVchan = VchanInitServer(0, VCHAN_BASE_PORT, VCHAN_BUFFER_SIZE, 5 * 60 * 1000);
@@ -1597,6 +1600,15 @@ static DWORD WatchForEvents(HANDLE stopEvent)
 
         if (1 == signaledEvent) // control vchan event
         {
+            // RELAY THE WAKE TO ANY BLOCKED SENDER, FIRST AND UNCONDITIONALLY. This loop is the only
+            // waiter on the daemon vchan's event, and that single auto-reset object carries incoming
+            // data, the daemon having consumed (so send room appeared) and the close alike. A
+            // data-less wake is routine here and is usually exactly the room notify a sender armed
+            // through VchanGetWriteBufferSize, so the relay must not be conditional on there being
+            // data to read. This loop never waits on g_VchanRoomEvent, so signalling it cannot wake
+            // this thread. SetEvent needs no lock, so it goes ahead of the critical section.
+            SetEvent(g_VchanRoomEvent);
+
             EnterCriticalSection(&g_DaemonCriticalSection);
             if (!daemonConnected)
             {

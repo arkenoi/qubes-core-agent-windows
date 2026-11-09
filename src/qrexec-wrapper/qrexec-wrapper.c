@@ -66,6 +66,27 @@ static HANDLE g_StopEvent = NULL;
 static volatile DWORD g_CtrlType = 0xFFFFFFFF;
 static HANDLE g_ClosedEvent = NULL;
 
+// ROOM IN THE SEND RING, SIGNALLED BY WHOEVER READS THE VCHAN. Auto-reset, created before the vchan
+// and never closed (the process exits), so a sender never waits on a handle another thread can close.
+//
+// It exists because libvchan_fd_for_select hands back the vchan's OWN event, which is AUTO-RESET and
+// therefore releases exactly ONE waiter - and this process has up to three: the stdout pump, the
+// stderr pump, and whichever loop is reading (EventLoop, or the no-local-process loop in wmain; they
+// are mutually exclusive branches, so one reader at a time). The peer's consume and incoming data
+// both fire that one object. A sender that waits on it directly can have its wake taken by the
+// reader, which hands nothing back - measured in supervision run 20261109T193803Z as two of three
+// full-ring stalls ending on a slice timeout instead of a wake.
+//
+// So only the reader waits on the vchan's event now, and signals this one on every wake it takes;
+// senders wait here. Auto-reset is REQUIRED, not a preference: a manual-reset event nobody resets
+// stays signalled, so a sender would wake, find no room, loop and wake again at full speed - the
+// spin this file already shipped once when a copied wait dropped its WAIT_FAILED guard.
+//
+// It is not what makes the wait correct - VchanWaitForSendSpace re-reads the ring every pass and its
+// slice timeout still bounds the wait - so the window before any reader is running (the hello inside
+// InitVchan) degrades to slice-paced re-checks, exactly as a lost wake does today, and not to a hang.
+static HANDLE g_VchanRoomEvent = NULL;
+
 // Set by wmain's cleanup just before it closes the data vchan, when nothing more is to be sent: the exit code (the
 // protocol's last message) has gone out, or the peer is gone, or the call is failing or being stopped. A pump still
 // waiting for room then gives up at once (VchanWaitForSendSpace), so the close never waits on a peer that has stopped
@@ -746,15 +767,15 @@ static BOOL VchanWaitForSendSpace(
     static_assert(VCHAN_BUFFER_SIZE >= sizeof(struct msg_header) + MAX_DATA_CHUNK,
                   "VCHAN_BUFFER_SIZE below sizeof(msg_header) + MAX_DATA_CHUNK makes this wait unsatisfiable");
 
-    HANDLE vchanEvent = NULL;   // a DUPLICATE this call owns; see the first-miss branch below
-    BOOL consumedWake = FALSE;
     BOOL blocked = FALSE;
-    BOOL handBack = TRUE;
     BOOL status = FALSE;
-    // HOW THE WAIT ENDED, on the exit line below, because a duration cannot say. Four stalls in
-    // win11r-up-20261109T162629Z took 102, 106, 103 and 24 ms against a 100 ms slice, which at ~15.6 ms
-    // timer granularity reads as three timeouts and one wake - but a peer that really took 100 ms looks
-    // identical, and before d228a03 this polled at 1 ms, so a lost wake cost 1 ms and now costs a slice.
+    // HOW THE WAIT ENDED, on the exit line below, because a duration cannot say: four stalls in
+    // win11r-up-20261109T162629Z took 102, 106, 103 and 24 ms against a 100 ms slice, and a peer that
+    // really took 100 ms is indistinguishable from a slice that expired. These two counters settled
+    // it. In supervision run 20261109T193803Z, three full-ring stalls reported 1 wake/0 timeouts,
+    // 0 wakes/1 timeout and 0 wakes/1 timeout - so two of three were THIS process losing the wake to
+    // its own reader, not a slow peer. That is what g_VchanRoomEvent fixes, and these counters are the
+    // instrument that says whether it worked: timeouts here should now be the peer, not us.
     ULONG wakes = 0;
     ULONG slices = 0;
 
@@ -774,8 +795,6 @@ static BOOL VchanWaitForSendSpace(
             // here requested: Jev returned insufficient_evidence 0.51 there and scored THIS one
             // degrade_when_going_down 0.96, the highest in the audit.
             LogInfo("QGAGOINGDOWN the vchan is being closed while %Iu bytes waited for room - not sent", size);
-            // No wake handed back: the event belongs to a ring another thread has just torn down.
-            handBack = FALSE;
             goto done;
         }
 
@@ -796,29 +815,12 @@ static BOOL VchanWaitForSendSpace(
 
         if (!blocked)
         {
-            HANDLE raw;
-
             blocked = TRUE;
             // INFO, not WARNING: the wait below releases g_VchanCs, so a full ring delays this sender
             // alone and backpressure is normal operation. Not Debug either - the shipped LogLevel is 3,
             // so this line is the only record that it happened. Receipt in the commit and the ledger.
             LogInfo("(%p, %s): vchan buffer full, blocking write (need %Iu, free %d) - waiting "
                 L"WITHOUT g_VchanCs", vchan, what, size, VchanGetWriteBufferSize(vchan));
-            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
-            // handle, and libvchan_close closes it - which, now that the wait below runs with the lock
-            // OFF, can happen while this thread is blocked on it. Waiting on a handle another thread
-            // closes is undefined: the value can be recycled by the next CreateEvent and the wait would
-            // then take a wake belonging to an unrelated object. A duplicate keeps the kernel object
-            // alive for exactly as long as this call needs it, and SetEvent on the duplicate still
-            // signals the same object, so the hand-back below still reaches the loops waiting on the
-            // original. A failed duplicate degrades to the plain sleep, same as no event at all.
-            raw = libvchan_fd_for_select(vchan);
-            if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(), &vchanEvent,
-                                         0, FALSE, DUPLICATE_SAME_ACCESS))
-            {
-                vchanEvent = NULL;
-                LogWarning("no vchan event to wait on, polling for room instead");
-            }
         }
 
         // QRSENDLOCK, AND THE REASON THIS FUNCTION CHANGED SHAPE. This lock keeps two senders' bytes
@@ -830,18 +832,34 @@ static BOOL VchanWaitForSendSpace(
         // message is in the ring yet - a sender admitted meanwhile writes a COMPLETE message - and this
         // pass re-reads the flag, the ring and the peer from scratch when it gets back in.
         LeaveCriticalSection(&g_VchanCs);
-        if (vchanEvent)
         {
-            // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
-            // VCHAN_NOTIFY_READ BEFORE it reads the space, so the peer's next consume fires this event.
-            // It is the same auto-reset event this process's own loops wait on for INCOMING data (:1803,
-            // :2109), so a wake taken here is handed back on every exit above. ONLY THAT DIRECTION IS
-            // HANDLED: the event is auto-reset, so it releases ONE waiter, and EventLoop hands nothing
-            // back - a wake meant for this thread can be consumed there and this wait runs to its slice.
-            DWORD w = WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS);
+            // NO WAKE IS LOST BETWEEN THE READER AND A SENDER, which is the fix. This thread no
+            // longer waits on the vchan's event at all, so it cannot take a wake meant for the reader
+            // and the reader cannot take one meant for it.
+            //
+            // THE CHECK-TO-WAIT WINDOW IS COVERED BY THE EVENT'S STATE. VchanGetWriteBufferSize above
+            // is libvchan_buffer_space, which arms VCHAN_NOTIFY_READ BEFORE it reads the space, so the
+            // peer's next consume fires the VCHAN's event; the reader takes it and relays here. If
+            // that happens after the check above and before this wait begins - including while
+            // g_VchanCs is being released - SetEvent has already left g_VchanRoomEvent signalled, an
+            // auto-reset event holds that state until a waiter takes it, and this wait returns at
+            // once. A condition variable would NOT be correct here for exactly that reason: it stores
+            // nothing, so a WakeAll landing in that window is lost unless the reader signals under
+            // g_VchanCs - which would put the reader back to blocking on the send lock, the shape
+            // this function was rewritten to remove.
+            //
+            // WHAT IS STILL NOT COVERED, AND IT IS NOT CLAIMED TO BE: an auto-reset event releases ONE
+            // waiter, and this process can have two senders blocked at once (the stdout and stderr
+            // pumps). One relay then frees one of them and the other runs to its slice although there
+            // is room. That is bounded by the slice, it is what the counters below measure, and it is
+            // strictly better than before - the wake used to be lost to a READER that never gave it
+            // back, where now it is only ever taken by another sender that does make progress with it.
+            // Manual-reset is not the answer: the sender would wake, find no room, loop and return
+            // instantly on the still-signalled event, which is the full-speed spin the guard below
+            // exists to prevent.
+            DWORD w = WaitForSingleObject(g_VchanRoomEvent, VCHAN_SEND_WAIT_SLICE_MS);
             if (w == WAIT_OBJECT_0)
             {
-                consumedWake = TRUE;
                 wakes++;
             }
             else if (w == WAIT_TIMEOUT)
@@ -857,23 +875,15 @@ static BOOL VchanWaitForSendSpace(
                 Sleep(VCHAN_SEND_WAIT_SLICE_MS);
             }
         }
-        else
-        {
-            Sleep(1);
-        }
         EnterCriticalSection(&g_VchanCs);
     }
 
 done:
-    // ONE EXIT, so the duplicate cannot be leaked on a path somebody adds later. handBack is cleared
-    // only where another thread has torn the ring down: handing a wake back there would signal an
-    // object nothing is waiting on any more, and the loops that DO watch it are gone with the vchan.
-    if (vchanEvent)
-    {
-        if (consumedWake && handBack)
-            SetEvent(vchanEvent);
-        CloseHandle(vchanEvent);
-    }
+    // NOTHING TO UNDO HERE ANY MORE, and that is the point of the change. This used to own a
+    // DuplicateHandle of the vchan's event and hand a consumed wake back on the way out, because it
+    // was waiting on an object two other loops also waited on and one that libvchan_close could close
+    // underneath it. It now waits on g_VchanRoomEvent, which no reader waits on and nothing closes, so
+    // there is no borrowed wake to return and no handle to release on a path somebody adds later.
     return status;
 }
 
@@ -1964,8 +1974,19 @@ DWORD EventLoop(
 
         switch (signaled)
         {
-        case 0: // vchan data ready or disconnected
+        case 0: // vchan data ready, the peer consumed (send room), or disconnected
         {
+            // RELAY THE WAKE TO ANY BLOCKED SENDER, FIRST AND UNCONDITIONALLY. This loop is the only
+            // waiter on the vchan's event, and that single auto-reset object carries three different
+            // facts: incoming data, the peer having consumed (so send room appeared), and the close.
+            // A data-less wake is routine here and is usually exactly the room notify a sender armed
+            // through VchanGetWriteBufferSize, so the relay must not be conditional on there being
+            // data to read - that would drop precisely the wakes the senders are waiting for.
+            // Signalling an auto-reset event with no waiter leaves it pending and costs the next
+            // sender one extra pass, which re-reads the ring. This loop never waits on
+            // g_VchanRoomEvent, so no amount of signalling it can wake this thread.
+            SetEvent(g_VchanRoomEvent);
+
             if (!libvchan_is_open(child->Vchan))
             {
                 // DRAIN BEFORE LEAVING. A closed vchan does not mean an empty one: the peer
@@ -2227,6 +2248,25 @@ int wmain(int argc, WCHAR *argv[])
     if (!g_StopEvent || !g_ClosedEvent || !SetConsoleCtrlHandler(WrapperCtrlHandler, TRUE))
         LogWarning("console-control shutdown not armed (error 0x%x): a control event will exit without closing the data vchan",
                    GetLastError());
+
+    // FATAL, unlike the two above: console-control shutdown is an optional courtesy, while every send
+    // on this vchan waits on g_VchanRoomEvent. Failing here keeps the branch out of the send path
+    // entirely - a sender never has to ask whether it has an event - and a process that cannot create
+    // one event at startup is out of handles and will fail at the next CreateProcess regardless.
+    // Created BEFORE InitVchan because the hello sent in there is already a sender.
+    g_VchanRoomEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_VchanRoomEvent)
+    {
+        // win_perror, as the other twenty failure reports in this file do: it carries the function
+        // name and the system error text. It IS a new log signature even so - the macro expands to
+        // _win_perror(__FUNCTION__, L"..."), so the prefix is the literal and the function name is
+        // part of the key, which makes this and the agent's copy two signatures, not one. Both are
+        // declared in mgmt/harness/log-sweep-baseline.json. The goto reaches cleanup with
+        // child->Vchan still NULL - the same state as the InitVchan failure immediately below.
+        status = win_perror("CreateEvent(send-room)");
+        goto cleanup;
+    }
+
     libvchan_register_logger(XifLogger, LogGetLevel());
 
     domain = _wtoi(domainName);
@@ -2272,7 +2312,11 @@ int wmain(int argc, WCHAR *argv[])
                 status = (DWORD)-1;
                 goto cleanup;
             }
-            // vchan data ready or disconnected
+            // vchan data ready, the peer consumed (send room), or disconnected.
+            // Same relay as EventLoop's, for the same reason: this branch is the reader when no local
+            // process was started, and it is then the only waiter on the vchan's event.
+            SetEvent(g_VchanRoomEvent);
+
             if (!libvchan_is_open(child->Vchan))
             {
                 LogDebug("vchan closed");
