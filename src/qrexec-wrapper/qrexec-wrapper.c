@@ -792,17 +792,9 @@ static BOOL VchanWaitForSendSpace(
             HANDLE raw;
 
             blocked = TRUE;
-            // INFO, NOT WARNING, AND THE SAME COMMIT IS WHY. The owner's rule is no warnings on normal
-            // operation, and with this wait no longer under g_VchanCs a full ring delays only this sender
-            // instead of stalling every thread in the process - so backpressure here is now routine. Jev
-            // over this site WITH the measurement the first call lacked: overlogged=0.93 handled=0.06
-            // defect=0.00 (conf 0.91), and info over debug 0.91 (conf 0.86). INFO and not Debug because
-            // the shipped LogLevel is 3, so a Debug line is never written at all, and this is the only
-            // record that backpressure happened; the sweep baseline tracks Info keys, so NEW/ROSE
-            // counting survives the demotion while the blocking gate, which grades only W and E, lets
-            // it go. The genuinely exceptional neighbours stay at WARNING: no event to wait on, and a
-            // peer that closed while bytes waited. windows-utils keeps its own at WARNING too - every
-            // caller pre-reserves before VchanSendBuffer, so if that one fires a reservation was wrong.
+            // INFO, not WARNING: the wait below releases g_VchanCs, so a full ring delays this sender
+            // alone and backpressure is normal operation. Not Debug either - the shipped LogLevel is 3,
+            // so this line is the only record that it happened. Receipt in the commit and the ledger.
             LogInfo("(%p, %s): vchan buffer full, blocking write (need %Iu, free %d) - waiting "
                 L"WITHOUT g_VchanCs", vchan, what, size, VchanGetWriteBufferSize(vchan));
             // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event

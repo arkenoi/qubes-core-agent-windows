@@ -402,11 +402,8 @@ BOOL VchanSendMessage(
             HANDLE raw;
 
             blocked = TRUE;
-            // INFO, NOT WARNING, for the reason spelled out at the same site in qrexec-wrapper.c: with the
-            // wait no longer under g_DaemonCriticalSection a full ring delays only this sender, so
-            // backpressure is routine, and the owner's rule is no warnings on normal operation. Jev
-            // overlogged=0.93 defect=0.00 (conf 0.91) over the wrapper's identical site - same operation,
-            // same disposition. The MEASUREMENT is the wrapper's alone: this site did not fire in that run.
+            // INFO, not WARNING: the wait below releases g_DaemonCriticalSection, so a full ring delays
+            // this sender alone. Same reasoning as qrexec-wrapper.c's identical site.
             LogInfo("ring full (need %Iu, free %d) - waiting for the daemon to drain before sending "
                 L"%s, WITHOUT g_DaemonCriticalSection", frameSize, VchanGetWriteBufferSize(vchan), what);
             // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
