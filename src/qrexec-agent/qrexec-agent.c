@@ -358,6 +358,11 @@ BOOL VchanSendMessage(
     BOOL consumedWake = FALSE;
     BOOL blocked = FALSE;
     BOOL handBack = TRUE;
+    // HOW THE WAIT ENDED, on the exit line below: a duration cannot separate a wake lost to the main
+    // loop from a daemon that really took the slice. Same counters as qrexec-wrapper.c's site, where
+    // the measurement that raised the question was taken.
+    ULONG wakes = 0;
+    ULONG slices = 0;
 
     for (;;)
     {
@@ -437,9 +442,25 @@ BOOL VchanSendMessage(
             // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
             // VCHAN_NOTIFY_READ BEFORE it reads the space, so the daemon's next consume fires this
             // event. It is the same auto-reset event the main loop waits on for INCOMING data (:1369),
-            // so a wake taken here is handed back on every exit.
-            if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+            // so a wake taken here is handed back on every exit. ONLY THAT DIRECTION IS HANDLED: the
+            // event is auto-reset, so it releases ONE waiter, and the main loop hands nothing back -
+            // a wake meant for this thread can be consumed there and this wait runs to its slice.
+            DWORD w = WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS);
+            if (w == WAIT_OBJECT_0)
+            {
                 consumedWake = TRUE;
+                wakes++;
+            }
+            else if (w == WAIT_TIMEOUT)
+            {
+                slices++;
+            }
+            else
+            {
+                // A failed wait returns at once, so without this the loop spins at full speed and
+                // churns g_DaemonCriticalSection every pass. Guard from agent/gui-agent/vchan.c:305.
+                Sleep(VCHAN_SEND_WAIT_SLICE_MS);
+            }
         }
         else
         {
@@ -448,7 +469,8 @@ BOOL VchanSendMessage(
     }
 
     if (blocked)
-        LogInfo("ring drained, sending %Iu byte(s) of %s", frameSize, what);
+        LogInfo("ring drained after %lu wake(s) and %lu slice timeout(s), sending %Iu byte(s) of %s",
+            wakes, slices, frameSize, what);
 
     // cbData == 0 is the EOF message: a header and no body, which this sends as the same single
     // frame rather than as a special case.

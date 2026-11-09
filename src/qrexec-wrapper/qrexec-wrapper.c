@@ -751,6 +751,12 @@ static BOOL VchanWaitForSendSpace(
     BOOL blocked = FALSE;
     BOOL handBack = TRUE;
     BOOL status = FALSE;
+    // HOW THE WAIT ENDED, on the exit line below, because a duration cannot say. Four stalls in
+    // win11r-up-20261109T162629Z took 102, 106, 103 and 24 ms against a 100 ms slice, which at ~15.6 ms
+    // timer granularity reads as three timeouts and one wake - but a peer that really took 100 ms looks
+    // identical, and before d228a03 this polled at 1 ms, so a lost wake cost 1 ms and now costs a slice.
+    ULONG wakes = 0;
+    ULONG slices = 0;
 
     for (;;)
     {
@@ -776,7 +782,8 @@ static BOOL VchanWaitForSendSpace(
         if (VchanGetWriteBufferSize(vchan) >= (int)size)
         {
             if (blocked)
-                LogInfo("(%p, %s): ring drained, %Iu bytes can go out whole", vchan, what, size);
+                LogInfo("(%p, %s): ring drained, %Iu bytes can go out whole after %lu wake(s) and "
+                    L"%lu slice timeout(s)", vchan, what, size, wakes, slices);
             status = TRUE;
             goto done;
         }
@@ -828,9 +835,27 @@ static BOOL VchanWaitForSendSpace(
             // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
             // VCHAN_NOTIFY_READ BEFORE it reads the space, so the peer's next consume fires this event.
             // It is the same auto-reset event this process's own loops wait on for INCOMING data (:1803,
-            // :2109), so a wake taken here is handed back on every exit above.
-            if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+            // :2109), so a wake taken here is handed back on every exit above. ONLY THAT DIRECTION IS
+            // HANDLED: the event is auto-reset, so it releases ONE waiter, and EventLoop hands nothing
+            // back - a wake meant for this thread can be consumed there and this wait runs to its slice.
+            DWORD w = WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS);
+            if (w == WAIT_OBJECT_0)
+            {
                 consumedWake = TRUE;
+                wakes++;
+            }
+            else if (w == WAIT_TIMEOUT)
+            {
+                slices++;
+            }
+            else
+            {
+                // A failed wait returns at once, so without this the loop spins at full speed and
+                // churns g_VchanCs every pass - worse than the 1 kHz Sleep(1) this wait replaced.
+                // The guard is agent/gui-agent/vchan.c:305-307's, dropped by all three copies.
+                // Counted in neither counter, so the exit line's numbers stop summing if it happens.
+                Sleep(VCHAN_SEND_WAIT_SLICE_MS);
+            }
         }
         else
         {
