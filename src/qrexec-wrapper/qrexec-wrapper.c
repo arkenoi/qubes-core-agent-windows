@@ -83,8 +83,20 @@ static HANDLE g_ClosedEvent = NULL;
 // spin this file already shipped once when a copied wait dropped its WAIT_FAILED guard.
 //
 // It is not what makes the wait correct - VchanWaitForSendSpace re-reads the ring every pass and its
-// slice timeout still bounds the wait - so the window before any reader is running (the hello inside
-// InitVchan) degrades to slice-paced re-checks, exactly as a lost wake does today, and not to a hang.
+// slice timeout still bounds the wait - so a send with no reader running degrades to slice-paced
+// re-checks, not to a hang.
+//
+// WHICH SENDS GET A RELAY AND WHICH DO NOT, because the relay can only come from a reader that is
+// actually reading. The output pumps (VchanSendData from StdoutThread/StderrThread at :1376) run
+// CONCURRENTLY with EventLoop, so they do get one - and they are the senders that were measured
+// stalling: all three stalls in run 20261109T193803Z were `output data`. The one-shot sends do NOT:
+// the hello goes out inside InitVchan before EventLoop starts, and the exit code (:2139) and the
+// cleanup sends (:2420-2422) go out after EventLoop has returned. For those the wait is now always a
+// slice where the vchan's event could previously have woken it, which is a latency REGRESSION for
+// them - accepted deliberately: each is a few bytes sent once on a 65536-byte ring, none has ever
+// been observed to stall, and the alternative is for a sender to learn whether it is itself the
+// reader thread and add the vchan's event back to its wait set only then. That machinery is not
+// worth it in a path that has produced two regressions in a week.
 static HANDLE g_VchanRoomEvent = NULL;
 
 // Set by wmain's cleanup just before it closes the data vchan, when nothing more is to be sent: the exit code (the

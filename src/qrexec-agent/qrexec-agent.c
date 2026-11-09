@@ -57,6 +57,17 @@ libvchan_t* g_DaemonVchan;
 // the hello - the main loop takes wakes meant for them and hands nothing back. Only the main loop
 // waits on it now; senders wait here. Auto-reset is required: a manual-reset event nobody resets
 // stays signalled and a sender would wake, find no room and spin.
+//
+// WHICH SENDS GET A RELAY AND WHICH DO NOT, because only a reader that is actually reading can
+// relay. PipeClientThread's trigger send (:1945) runs on its own thread and does get one. The other
+// two run ON THE MAIN LOOP'S OWN THREAD - VchanSendHello from the daemon-connect arm (:1618) and
+// release_connection's MSG_CONNECTION_TERMINATED (:1683) - so while either is blocked the main loop
+// is not waiting on the vchan and nothing can signal this event. Those two now always run to a slice
+// where the vchan's event could previously have woken them: a latency REGRESSION for them, accepted
+// deliberately. Both are a few bytes sent once on a 65536-byte ring, neither has been observed to
+// stall, and the fix is bounded by the slice. Teaching a sender to recognise that it is itself the
+// reader thread and re-add the vchan's event to its wait set only then is the alternative, and is
+// not worth the machinery in a path that has produced two regressions in a week.
 static HANDLE g_VchanRoomEvent = NULL;
 
 CRITICAL_SECTION g_DaemonCriticalSection;
