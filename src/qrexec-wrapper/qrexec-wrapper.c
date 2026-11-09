@@ -746,9 +746,11 @@ static BOOL VchanWaitForSendSpace(
     static_assert(VCHAN_BUFFER_SIZE >= sizeof(struct msg_header) + MAX_DATA_CHUNK,
                   "VCHAN_BUFFER_SIZE below sizeof(msg_header) + MAX_DATA_CHUNK makes this wait unsatisfiable");
 
-    HANDLE vchanEvent = NULL;
+    HANDLE vchanEvent = NULL;   // a DUPLICATE this call owns; see the first-miss branch below
     BOOL consumedWake = FALSE;
     BOOL blocked = FALSE;
+    BOOL handBack = TRUE;
+    BOOL status = FALSE;
 
     for (;;)
     {
@@ -767,34 +769,46 @@ static BOOL VchanWaitForSendSpace(
             // degrade_when_going_down 0.96, the highest in the audit.
             LogInfo("QGAGOINGDOWN the vchan is being closed while %Iu bytes waited for room - not sent", size);
             // No wake handed back: the event belongs to a ring another thread has just torn down.
-            return FALSE;
+            handBack = FALSE;
+            goto done;
         }
 
         if (VchanGetWriteBufferSize(vchan) >= (int)size)
         {
             if (blocked)
                 LogInfo("(%p, %s): ring drained, %Iu bytes can go out whole", vchan, what, size);
-            if (consumedWake)
-                SetEvent(vchanEvent);
-            return TRUE;
+            status = TRUE;
+            goto done;
         }
 
         if (!libvchan_is_open(vchan))
         {
             LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
-            if (consumedWake)
-                SetEvent(vchanEvent);
-            return FALSE;
+            goto done;
         }
 
         if (!blocked)
         {
+            HANDLE raw;
+
             blocked = TRUE;
-            vchanEvent = libvchan_fd_for_select(vchan);
             LogWarning("(%p, %s): vchan buffer full, blocking write (need %Iu, free %d) - waiting "
                 L"WITHOUT g_VchanCs", vchan, what, size, VchanGetWriteBufferSize(vchan));
-            if (!vchanEvent)
+            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
+            // handle, and libvchan_close closes it - which, now that the wait below runs with the lock
+            // OFF, can happen while this thread is blocked on it. Waiting on a handle another thread
+            // closes is undefined: the value can be recycled by the next CreateEvent and the wait would
+            // then take a wake belonging to an unrelated object. A duplicate keeps the kernel object
+            // alive for exactly as long as this call needs it, and SetEvent on the duplicate still
+            // signals the same object, so the hand-back below still reaches the loops waiting on the
+            // original. A failed duplicate degrades to the plain sleep, same as no event at all.
+            raw = libvchan_fd_for_select(vchan);
+            if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(), &vchanEvent,
+                                         0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                vchanEvent = NULL;
                 LogWarning("no vchan event to wait on, polling for room instead");
+            }
         }
 
         // QRSENDLOCK, AND THE REASON THIS FUNCTION CHANGED SHAPE. This lock keeps two senders' bytes
@@ -821,6 +835,18 @@ static BOOL VchanWaitForSendSpace(
         }
         EnterCriticalSection(&g_VchanCs);
     }
+
+done:
+    // ONE EXIT, so the duplicate cannot be leaked on a path somebody adds later. handBack is cleared
+    // only where another thread has torn the ring down: handing a wake back there would signal an
+    // object nothing is waiting on any more, and the loops that DO watch it are gone with the vchan.
+    if (vchanEvent)
+    {
+        if (consumedWake && handBack)
+            SetEvent(vchanEvent);
+        CloseHandle(vchanEvent);
+    }
+    return status;
 }
 
 /**

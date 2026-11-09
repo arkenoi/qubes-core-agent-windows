@@ -354,9 +354,10 @@ BOOL VchanSendMessage(
     if (cbData > 0)
         CopyMemory(frame + sizeof(header), data, cbData);
 
-    HANDLE vchanEvent = NULL;
+    HANDLE vchanEvent = NULL;   // a DUPLICATE this call owns; see the first-miss branch below
     BOOL consumedWake = FALSE;
     BOOL blocked = FALSE;
+    BOOL handBack = TRUE;
 
     for (;;)
     {
@@ -382,7 +383,7 @@ BOOL VchanSendMessage(
         {
             LogInfo("QGAGOINGDOWN the daemon vchan was closed before %u byte(s) of %s could be sent", cbData, what);
             // No wake handed back: the event belonged to a ring that has just been torn down.
-            consumedWake = FALSE;
+            handBack = FALSE;
             goto cleanup;
         }
 
@@ -398,12 +399,26 @@ BOOL VchanSendMessage(
 
         if (!blocked)
         {
+            HANDLE raw;
+
             blocked = TRUE;
-            vchanEvent = libvchan_fd_for_select(vchan);
             LogWarning("ring full (need %Iu, free %d) - waiting for the daemon to drain before sending "
                 L"%s, WITHOUT g_DaemonCriticalSection", frameSize, VchanGetWriteBufferSize(vchan), what);
-            if (!vchanEvent)
+            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
+            // handle, and libvchan_close closes it - which, now that the wait below runs with the lock
+            // OFF, can happen while this thread is blocked on it. Waiting on a handle another thread
+            // closes is undefined: the value can be recycled by the next CreateEvent and the wait would
+            // then take a wake belonging to an unrelated object. A duplicate keeps the kernel object
+            // alive for exactly as long as this call needs it, and SetEvent on the duplicate still
+            // signals the same object, so the hand-back below still reaches the loops waiting on the
+            // original. A failed duplicate degrades to the plain sleep, same as no event at all.
+            raw = libvchan_fd_for_select(vchan);
+            if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(), &vchanEvent,
+                                         0, FALSE, DUPLICATE_SAME_ACCESS))
+            {
+                vchanEvent = NULL;
                 LogWarning("no vchan event to wait on, polling for room instead");
+            }
         }
 
         // QRSENDLOCK. This lock orders writes into the ring; it is not what makes the wait correct.
@@ -444,8 +459,12 @@ BOOL VchanSendMessage(
     status = TRUE;
 
 cleanup:
-    if (consumedWake)
-        SetEvent(vchanEvent);
+    if (vchanEvent)
+    {
+        if (consumedWake && handBack)
+            SetEvent(vchanEvent);
+        CloseHandle(vchanEvent);
+    }
     LeaveCriticalSection(&g_DaemonCriticalSection);
     free(frame);
     return status;
