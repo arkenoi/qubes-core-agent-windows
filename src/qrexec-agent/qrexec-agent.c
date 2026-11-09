@@ -282,6 +282,14 @@ static DWORD WaitForQdb(HANDLE stopEvent)
     return ERROR_TIMEOUT;
 }
 
+// Longest a sender sleeps before it re-reads its exit conditions while waiting for ring room. NOT a
+// deadline, and nothing here gives up when it expires: the wait still ends only when room appears,
+// when the peer closes, or when this component tears down. The slice exists because a peer that dies
+// without firing the channel never fires it again, so the per-slice re-check is what notices that; a
+// wake that fails to arrive costs one slice. Same value and reasoning as windows-utils'
+// vchan-common.c and agent/gui-agent/vchan.c's VCHAN_RESERVE_WAIT_SLICE_MS, where the idiom is proven.
+#define VCHAN_SEND_WAIT_SLICE_MS 100
+
 /**
  * @brief Send message to the vchan peer.
  * @param vchan Control vchan.
@@ -346,26 +354,84 @@ BOOL VchanSendMessage(
     if (cbData > 0)
         CopyMemory(frame + sizeof(header), data, cbData);
 
-    EnterCriticalSection(&g_DaemonCriticalSection);
+    HANDLE vchanEvent = NULL;
+    BOOL consumedWake = FALSE;
+    BOOL blocked = FALSE;
 
-    // TOCTOU, and the reason ordering the close under this lock is not sufficient by itself: every
-    // caller evaluates g_DaemonVchan BEFORE this acquisition (:382, :1774, and VchanSendHello's
-    // argument at :1447), so between that read and this line ServiceCleanup can have taken the lock,
-    // closed the ring and NULLed the global - leaving `vchan` a dangling NON-NULL pointer that the
-    // assert above passes without complaint. The lock protects the global, never a copy taken outside
-    // it, so the global is the authority and it is only stable in here. qrexec-wrapper holds the same
-    // rule the same way: VchanSendData reads child->Vchan under g_VchanCs instead of trusting a copy.
-    // Every call reaches here with g_DaemonVchan, so an inequality means the vchan was torn down under
-    // this call and touching it would be the use-after-unmap.
-    // BOTH halves are needed. A caller that read the global BEFORE the close holds a stale non-NULL
-    // pointer (second half); one that read it AFTER holds NULL, and NULL != NULL is false, so without
-    // the first half that caller would pass this check and hand NULL to VchanGetWriteBufferSize. The
-    // assert above does not cover it - asserts compile out of the shipped build.
-    if (!g_DaemonVchan || g_DaemonVchan != vchan)
+    for (;;)
     {
-        LogInfo("QGAGOINGDOWN the daemon vchan was closed before %u byte(s) of %s could be sent", cbData, what);
-        goto cleanup;
+        EnterCriticalSection(&g_DaemonCriticalSection);
+
+        // TOCTOU, and the reason ordering the close under this lock is not sufficient by itself: every
+        // caller evaluates g_DaemonVchan BEFORE this acquisition (:382, :1774, and VchanSendHello's
+        // argument at :1447), so between that read and this line ServiceCleanup can have taken the lock,
+        // closed the ring and NULLed the global - leaving `vchan` a dangling NON-NULL pointer that the
+        // assert above passes without complaint. The lock protects the global, never a copy taken outside
+        // it, so the global is the authority and it is only stable in here. qrexec-wrapper holds the same
+        // rule the same way: VchanSendData reads child->Vchan under g_VchanCs instead of trusting a copy.
+        // Every call reaches here with g_DaemonVchan, so an inequality means the vchan was torn down under
+        // this call and touching it would be the use-after-unmap.
+        // BOTH halves are needed. A caller that read the global BEFORE the close holds a stale non-NULL
+        // pointer (second half); one that read it AFTER holds NULL, and NULL != NULL is false, so without
+        // the first half that caller would pass this check and hand NULL to VchanGetWriteBufferSize. The
+        // assert above does not cover it - asserts compile out of the shipped build.
+        // IT IS ALSO THE RE-VALIDATION THE WAIT BELOW NEEDS, which is why it is FIRST in this loop and
+        // ahead of every ring read: the wait RELEASES this lock, so each later pass re-enters having been
+        // away - in exactly the position of a caller that read the global outside the lock.
+        if (!g_DaemonVchan || g_DaemonVchan != vchan)
+        {
+            LogInfo("QGAGOINGDOWN the daemon vchan was closed before %u byte(s) of %s could be sent", cbData, what);
+            // No wake handed back: the event belonged to a ring that has just been torn down.
+            consumedWake = FALSE;
+            goto cleanup;
+        }
+
+        if (VchanGetWriteBufferSize(vchan) >= (int)frameSize)
+            break;      // room, with the lock held and not released since the observation
+
+        if (!libvchan_is_open(vchan))
+        {
+            LogWarning("the daemon closed the vchan while %Iu byte(s) of %s waited for room - not sent",
+                frameSize, what);
+            goto cleanup;
+        }
+
+        if (!blocked)
+        {
+            blocked = TRUE;
+            vchanEvent = libvchan_fd_for_select(vchan);
+            LogWarning("ring full (need %Iu, free %d) - waiting for the daemon to drain before sending "
+                L"%s, WITHOUT g_DaemonCriticalSection", frameSize, VchanGetWriteBufferSize(vchan), what);
+            if (!vchanEvent)
+                LogWarning("no vchan event to wait on, polling for room instead");
+        }
+
+        // QRSENDLOCK. This lock orders writes into the ring; it is not what makes the wait correct.
+        // Held across the wait - the state the comment above the static_assert describes, "with
+        // g_DaemonCriticalSection held, which stops the whole agent and not just the send" - one daemon
+        // that stops draining stops every thread in this agent that needs the vchan: every
+        // qrexec_trigger service request, the hello, and ServiceCleanup's own close. Releasing it costs
+        // nothing here, because the whole message is ONE buffer (see above) and none of it is in the ring
+        // yet: a sender admitted meanwhile writes a COMPLETE frame, and this pass re-reads the global,
+        // the ring and the peer from scratch when it gets back in.
+        LeaveCriticalSection(&g_DaemonCriticalSection);
+        if (vchanEvent)
+        {
+            // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
+            // VCHAN_NOTIFY_READ BEFORE it reads the space, so the daemon's next consume fires this
+            // event. It is the same auto-reset event the main loop waits on for INCOMING data (:1369),
+            // so a wake taken here is handed back on every exit.
+            if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+                consumedWake = TRUE;
+        }
+        else
+        {
+            Sleep(1);
+        }
     }
+
+    if (blocked)
+        LogInfo("ring drained, sending %Iu byte(s) of %s", frameSize, what);
 
     // cbData == 0 is the EOF message: a header and no body, which this sends as the same single
     // frame rather than as a special case.
@@ -378,6 +444,8 @@ BOOL VchanSendMessage(
     status = TRUE;
 
 cleanup:
+    if (consumedWake)
+        SetEvent(vchanEvent);
     LeaveCriticalSection(&g_DaemonCriticalSection);
     free(frame);
     return status;

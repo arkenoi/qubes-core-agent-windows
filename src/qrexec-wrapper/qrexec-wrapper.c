@@ -701,14 +701,29 @@ DWORD StartChild(
     return ERROR_SUCCESS;
 }
 
+// Longest a sender sleeps before it re-reads its exit conditions while waiting for ring room. NOT a
+// deadline, and nothing here gives up when it expires: the wait still ends only when room appears,
+// when the peer closes, or when this component tears down. The slice exists because a peer that dies
+// without firing the channel never fires it again, so the per-slice re-check is what notices that; a
+// wake that fails to arrive costs one slice. Same value and reasoning as windows-utils'
+// vchan-common.c and agent/gui-agent/vchan.c's VCHAN_RESERVE_WAIT_SLICE_MS, where the idiom is proven.
+#define VCHAN_SEND_WAIT_SLICE_MS 100
+
 /**
  * @brief Wait until the data vchan has room for @a size bytes; FALSE if it closed first.
  *
  * VchanSendBuffer (windows-utils) waits for room itself, but never checks that the peer is still there: a peer that
  * goes away while the ring is full (killed mid-transfer) leaves that wait spinning forever, with g_VchanCs held.
- * VchanSendMessage waits here instead, under the same lock, for the WHOLE message (header and data), so both
- * VchanSendBuffer calls find their room and never spin, and a message goes out whole or not at all; only the peer
- * frees room, so nothing can take it in between. It logs the warning VchanSendBuffer logged when it had to wait.
+ * VchanSendMessage waits here instead for the WHOLE message (header and data), so both VchanSendBuffer calls find
+ * their room and never spin, and a message goes out whole or not at all. It logs the warning VchanSendBuffer logged
+ * when it had to wait.
+ *
+ * CALLED WITH g_VchanCs HELD AND RETURNS WITH IT HELD, BUT RELEASES IT WHILE IT WAITS. The lock orders writes into
+ * the ring; it is not what makes the wait correct. Held across the wait, one peer that stopped draining stopped
+ * every thread in this process that needs the vchan, the close path included. Nothing of the message is in the ring
+ * while this waits, so a sender admitted in the meantime writes a COMPLETE message of its own; and room observed
+ * after the final re-acquisition cannot then be taken, because only the peer frees room and only a holder of this
+ * lock consumes it, so the caller's writes still cannot block.
  * @param vchan Data vchan.
  * @param size Bytes the next VchanSendBuffer calls will write.
  * @param what Description of the buffer (for logging).
@@ -722,8 +737,8 @@ static BOOL VchanWaitForSendSpace(
 {
     // NO EXIT HERE FOR "THE RING CANNOT HOLD size AT ALL": this waits for room, for the peer's close,
     // or for our own, and for nothing else - so a ring smaller than the largest message
-    // VchanSendMessage can ask for is not slow, it HANGS, spinning the Sleep(1) below with g_VchanCs
-    // held until the peer hangs up. The largest ask is sizeof(msg_header) + MAX_DATA_CHUNK = 4104:
+    // VchanSendMessage can ask for is not slow, it HANGS - in the wait below, until the peer hangs up.
+    // No longer with g_VchanCs held, but still forever. The largest ask is sizeof(msg_header) + MAX_DATA_CHUNK = 4104:
     // the output pump reads at most MAX_DATA_CHUNK, and every other sender here is smaller
     // (g_FailureText is 512, the hello and the exit code a few bytes). The floor is a BUILD error so
     // that shrinking VCHAN_BUFFER_SIZE to save grants - 65536 per direction costs 33 - cannot
@@ -731,28 +746,81 @@ static BOOL VchanWaitForSendSpace(
     static_assert(VCHAN_BUFFER_SIZE >= sizeof(struct msg_header) + MAX_DATA_CHUNK,
                   "VCHAN_BUFFER_SIZE below sizeof(msg_header) + MAX_DATA_CHUNK makes this wait unsatisfiable");
 
-    if (VchanGetWriteBufferSize(vchan) < (int)size)
-        LogWarning("(%p, %s): vchan buffer full, blocking write", vchan, what);
-    while (VchanGetWriteBufferSize(vchan) < (int)size)
+    HANDLE vchanEvent = NULL;
+    BOOL consumedWake = FALSE;
+    BOOL blocked = FALSE;
+
+    for (;;)
     {
-        if (!libvchan_is_open(vchan))
-        {
-            LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
-            return FALSE;
-        }
+        // OUR OWN CLOSE FIRST, AND BEFORE ANY RING READ, because this loop RELEASES g_VchanCs while it
+        // waits. Both close sites set g_VchanClosing BEFORE they take g_VchanCs (:2156, :2256) and then
+        // close the vchan and NULL child->Vchan under it, so a sender that resumes after that close holds
+        // a `vchan` argument which has already been freed. Reading the flag touches nothing, while
+        // libvchan_is_open and the ring query below both dereference it. That ordering is what makes
+        // dropping the lock safe, and it is why this is a for(;;) and not a while on the ring.
         if (g_VchanClosing)
         {
             // OUR OWN CLOSE IS THIS BRANCH'S CONDITION (g_VchanClosing), so ADR-supervision 7
             // applies statically and there is nothing to read at runtime - the level is the fix.
-            // The SIBLING above is not this case: there the PEER closed the vchan, which nobody
+            // The SIBLING below is not this case: there the PEER closed the vchan, which nobody
             // here requested: Jev returned insufficient_evidence 0.51 there and scored THIS one
             // degrade_when_going_down 0.96, the highest in the audit.
             LogInfo("QGAGOINGDOWN the vchan is being closed while %Iu bytes waited for room - not sent", size);
+            // No wake handed back: the event belongs to a ring another thread has just torn down.
             return FALSE;
         }
-        Sleep(1);
+
+        if (VchanGetWriteBufferSize(vchan) >= (int)size)
+        {
+            if (blocked)
+                LogInfo("(%p, %s): ring drained, %Iu bytes can go out whole", vchan, what, size);
+            if (consumedWake)
+                SetEvent(vchanEvent);
+            return TRUE;
+        }
+
+        if (!libvchan_is_open(vchan))
+        {
+            LogWarning("the peer closed the vchan while %Iu bytes waited for room - not sent", size);
+            if (consumedWake)
+                SetEvent(vchanEvent);
+            return FALSE;
+        }
+
+        if (!blocked)
+        {
+            blocked = TRUE;
+            vchanEvent = libvchan_fd_for_select(vchan);
+            LogWarning("(%p, %s): vchan buffer full, blocking write (need %Iu, free %d) - waiting "
+                L"WITHOUT g_VchanCs", vchan, what, size, VchanGetWriteBufferSize(vchan));
+            if (!vchanEvent)
+                LogWarning("no vchan event to wait on, polling for room instead");
+        }
+
+        // QRSENDLOCK, AND THE REASON THIS FUNCTION CHANGED SHAPE. This lock keeps two senders' bytes
+        // from interleaving in the ring. It is NOT what makes the wait correct, and waiting under it
+        // made ONE peer that stopped draining stop EVERY thread in this process that needs the vchan -
+        // the output pumps, the exit-code send, and the close path itself, whose comment at :2245 says
+        // "taking the lock here never waits on the peer". That was false for exactly this reason: a
+        // sender parked in here was holding it. Releasing it costs nothing, because nothing of this
+        // message is in the ring yet - a sender admitted meanwhile writes a COMPLETE message - and this
+        // pass re-reads the flag, the ring and the peer from scratch when it gets back in.
+        LeaveCriticalSection(&g_VchanCs);
+        if (vchanEvent)
+        {
+            // No wake can be lost: VchanGetWriteBufferSize above is libvchan_buffer_space, which arms
+            // VCHAN_NOTIFY_READ BEFORE it reads the space, so the peer's next consume fires this event.
+            // It is the same auto-reset event this process's own loops wait on for INCOMING data (:1803,
+            // :2109), so a wake taken here is handed back on every exit above.
+            if (WaitForSingleObject(vchanEvent, VCHAN_SEND_WAIT_SLICE_MS) == WAIT_OBJECT_0)
+                consumedWake = TRUE;
+        }
+        else
+        {
+            Sleep(1);
+        }
+        EnterCriticalSection(&g_VchanCs);
     }
-    return TRUE;
 }
 
 /**
@@ -782,6 +850,22 @@ BOOL VchanSendMessage(
     header.type = messageType;
     header.len = cbData;
     EnterCriticalSection(&g_VchanCs);
+
+    // OUR OWN CLOSE FIRST, AND AHEAD OF THE libvchan_is_open BELOW, WHICH DEREFERENCES `vchan`.
+    // Callers read the pointer under this lock and release it before calling in (VchanSendData), and
+    // VchanSendExitCode reads child->Vchan without the lock at all, so between a caller's read and
+    // this acquisition wmain's cleanup can have closed the vchan and NULLed child->Vchan - leaving a
+    // dangling NON-NULL argument that the assert above passes. Both close sites set g_VchanClosing
+    // BEFORE they take this lock (:2224, :2324), so whenever that has happened the flag is already 1,
+    // and reading it touches nothing. Same rule and same ordering as the wait in
+    // VchanWaitForSendSpace. It cannot suppress the exit code: VchanSendExitCode runs at :2036 and
+    // :2296, both BEFORE either site raises the flag.
+    if (g_VchanClosing)
+    {
+        LogInfo("QGAGOINGDOWN the vchan is being closed, %u byte(s) of %s (msg 0x%x) not sent",
+            cbData, what, messageType);
+        goto cleanup;
+    }
 
     if (!libvchan_is_open(vchan))
     {
@@ -874,6 +958,7 @@ BOOL VchanSendData(
 {
     ULONG messageType;
     BOOL ok;
+    libvchan_t *vchan;
 
     assert(child);
     if (!child)
@@ -895,11 +980,22 @@ BOOL VchanSendData(
     }
 
     // child->Vchan is read under g_VchanCs because wmain's cleanup closes the vchan and clears it under that lock
-    // while an output pump may still be running (see there): the pump either finishes this send before the close or
+    // while an output pump may still be running (see there): the pump either reads the pointer before the close or
     // finds NULL after it, never a vchan being or already closed.
+    //
+    // THE LOCK COVERS THE POINTER READ, NOT THE SEND, and that is the QRSENDLOCK fix on the hottest sender in this
+    // process. VchanSendMessage takes g_VchanCs itself, so holding it across the call was a RECURSIVE acquisition:
+    // the release inside VchanWaitForSendSpace's wait for ring room dropped the count from 2 to 1 and the lock
+    // stayed held, which made the lock-releasing wait a no-op on exactly this path - the output pump. One peer that
+    // stopped draining therefore stopped every other thread in this process (the other pump, the exit-code send and
+    // wmain's own close) instead of only the transfer that found the ring full.
+    // The gap this opens between the read and VchanSendMessage's own acquisition is the gap qrexec-agent documents
+    // on g_DaemonVchan, and it closes the same way: both close sites raise g_VchanClosing BEFORE taking the lock,
+    // and VchanSendMessage now re-reads that flag under its own hold before anything dereferences the pointer.
     EnterCriticalSection(&g_VchanCs);
-    ok = child->Vchan && VchanSendMessage(child->Vchan, messageType, data, cbData, L"output data");
+    vchan = child->Vchan;
     LeaveCriticalSection(&g_VchanCs);
+    ok = vchan && VchanSendMessage(vchan, messageType, data, cbData, L"output data");
     return ok;
 }
 
