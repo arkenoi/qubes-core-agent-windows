@@ -301,6 +301,24 @@ BOOL VchanSendMessage(
 {
     struct msg_header header;
     BOOL status = FALSE;
+    PBYTE frame = NULL;
+    size_t frameSize;
+
+    // THE RING MUST HOLD THE LARGEST MESSAGE THIS COMPONENT CAN ASK TO SEND. The wait inside
+    // VchanSendBuffer has no exit for "the ring can never hold size" - it ends when room appears,
+    // when the peer closes, or when we tear down, and for nothing else - so a ring smaller than the
+    // biggest ask does not run slowly, it HANGS, with g_DaemonCriticalSection held, which stops the
+    // whole agent and not just the send. The biggest ask is the v4 trigger, and its size is not ours
+    // to bound: the service name comes off the qrexec_trigger pipe from an in-guest caller and is
+    // accepted up to MAX_SERVICE_NAME_LEN_V4 (:1676). 8 + 160 + 65000 = 65168 against 65536, so there
+    // are 368 bytes of margin today. Raising this side's send toward dom0's 64 KiB - the stated
+    // Linux-parity goal - MUST grow VCHAN_BUFFER_SIZE in the same change, and this makes that a BUILD
+    // ERROR instead of a guest that hangs. qrexec-wrapper.c carries the same assertion for its own
+    // largest ask; this component had none.
+    static_assert(VCHAN_BUFFER_SIZE >= sizeof(struct msg_header)
+                                       + sizeof(struct trigger_service_params4_fixed)
+                                       + MAX_SERVICE_NAME_LEN_V4,
+                  "VCHAN_BUFFER_SIZE cannot hold the largest v4 trigger, which makes this send's wait unsatisfiable");
 
     assert(vchan);
 
@@ -308,6 +326,26 @@ BOOL VchanSendMessage(
 
     header.type = messageType;
     header.len = cbData;
+
+    // ONE WRITE FOR THE WHOLE MESSAGE, and the reason is the partial commit. Sending the header and
+    // then the body as two VchanSendBuffer calls put the header in the ring and THEN waited for the
+    // body's room, so a daemon that was slow or gone left a committed header promising bytes that had
+    // not been sent, with this lock held for the whole wait. qrexec-wrapper fixed exactly this on
+    // 2026-09-30 (1df5a7b) by waiting for the WHOLE message before either send, so "a message goes
+    // out whole or not at all" - and that fix was WRAPPER-LOCAL, like g_VchanClosing was. A single
+    // write needs no second wait and no shared reservation API to get the same property. The copy is
+    // free here: this vchan carries small control frames (hello, connection-terminated, trigger).
+    frameSize = sizeof(header) + cbData;
+    frame = malloc(frameSize);
+    if (!frame)
+    {
+        LogError("out of memory for a %Iu byte %s frame", frameSize, what);
+        return FALSE;   // before the lock: nothing to release yet
+    }
+    CopyMemory(frame, &header, sizeof(header));
+    if (cbData > 0)
+        CopyMemory(frame + sizeof(header), data, cbData);
+
     EnterCriticalSection(&g_DaemonCriticalSection);
 
     // TOCTOU, and the reason ordering the close under this lock is not sufficient by itself: every
@@ -329,21 +367,11 @@ BOOL VchanSendMessage(
         goto cleanup;
     }
 
-    if (!VchanSendBuffer(vchan, &header, sizeof(header), L"header"))
+    // cbData == 0 is the EOF message: a header and no body, which this sends as the same single
+    // frame rather than as a special case.
+    if (!VchanSendBuffer(vchan, frame, frameSize, what))
     {
-        LogError("VchanSendBuffer(header for %s) failed", what);
-        goto cleanup;
-    }
-
-    if (cbData == 0) // EOF
-    {
-        status = TRUE;
-        goto cleanup;
-    }
-
-    if (!VchanSendBuffer(vchan, data, cbData, what))
-    {
-        LogError("VchanSendBuffer(%s) failed", what);
+        LogError("VchanSendBuffer(%s, %Iu bytes incl. header) failed", what, frameSize);
         goto cleanup;
     }
 
@@ -351,6 +379,7 @@ BOOL VchanSendMessage(
 
 cleanup:
     LeaveCriticalSection(&g_DaemonCriticalSection);
+    free(frame);
     return status;
 }
 
