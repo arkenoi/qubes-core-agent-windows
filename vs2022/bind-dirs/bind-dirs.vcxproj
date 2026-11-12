@@ -17,11 +17,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\bind-dirs\bind-dirs.c" />
+    <ClCompile Include="..\..\src\bind-dirs\boot-clock.c" />
     <ClCompile Include="..\..\src\bind-dirs\main.c" />
     <ClCompile Include="..\..\src\relocate-dir\io.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\bind-dirs\bind-dirs.h" />
+    <ClInclude Include="..\..\src\bind-dirs\boot-clock.h" />
     <ClInclude Include="..\..\src\relocate-dir\io.h" />
     <ClInclude Include="..\..\src\relocate-dir\nt.h" />
   </ItemGroup>

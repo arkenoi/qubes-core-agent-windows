@@ -116,6 +116,55 @@ NtQuerySystemTime(
     OUT LARGE_INTEGER *CurrentTime
     );
 
+// Not declared by ntifs.h (only the Zw variant is); exported by ntdll, same signature.
+NTSTATUS
+NTAPI
+NtQueryValueKey(
+    IN  HANDLE KeyHandle,
+    IN  PUNICODE_STRING ValueName,
+    IN  KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
+    OUT PVOID KeyValueInformation OPTIONAL,
+    IN  ULONG Length,
+    OUT PULONG ResultLength
+    );
+
+// The rest are for bind-dirs' boot-time clock correction (bind-dirs/boot-clock.c). None is in the
+// km headers - ntifs.h has only ZwQueryKey, ZwFlushBuffersFile and NtFlushBuffersFileEx - and all
+// are ntdll exports, which ntdllp.lib resolves.
+NTSTATUS
+NTAPI
+NtQueryKey(
+    IN  HANDLE KeyHandle,
+    IN  KEY_INFORMATION_CLASS KeyInformationClass,
+    OUT PVOID KeyInformation OPTIONAL,
+    IN  ULONG Length,
+    OUT PULONG ResultLength
+    );
+
+NTSTATUS
+NTAPI
+NtSetSystemTime(
+    IN  PLARGE_INTEGER SystemTime OPTIONAL,
+    OUT PLARGE_INTEGER PreviousTime OPTIONAL
+    );
+
+// The class is a plain ULONG: the km headers carry no SYSTEM_INFORMATION_CLASS to agree with.
+NTSTATUS
+NTAPI
+NtQuerySystemInformation(
+    IN  ULONG SystemInformationClass,
+    OUT PVOID SystemInformation,
+    IN  ULONG SystemInformationLength,
+    OUT PULONG ReturnLength OPTIONAL
+    );
+
+NTSTATUS
+NTAPI
+NtFlushBuffersFile(
+    IN  HANDLE FileHandle,
+    OUT PIO_STATUS_BLOCK IoStatusBlock
+    );
+
 // process startup parameters
 
 typedef struct _PEB_LDR_DATA

@@ -39,6 +39,7 @@
 
 #include "../relocate-dir/io.h"
 #include "bind-dirs.h"
+#include "boot-clock.h"
 
 HANDLE g_Heap;   // io.c allocates from it
 
@@ -180,7 +181,7 @@ static NTSTATUS EnablePrivileges(void)
     TOKEN_PRIVILEGES *tp = NULL;
     ULONG size;
     NTSTATUS status;
-    const int privilegeCount = 3;
+    const int privilegeCount = 4;
 
     size = sizeof(TOKEN_PRIVILEGES) + (privilegeCount - 1) * sizeof(LUID_AND_ATTRIBUTES);
     tp = RtlAllocateHeap(g_Heap, 0, size);
@@ -201,6 +202,9 @@ static NTSTATUS EnablePrivileges(void)
     tp->Privileges[2].Luid.HighPart = 0;
     tp->Privileges[2].Luid.LowPart = SE_RESTORE_PRIVILEGE;  // set ownership on the seed copy
     tp->Privileges[2].Attributes = SE_PRIVILEGE_ENABLED;
+    tp->Privileges[3].Luid.HighPart = 0;
+    tp->Privileges[3].Luid.LowPart = SE_SYSTEMTIME_PRIVILEGE; // boot-clock.c sets the time
+    tp->Privileges[3].Attributes = SE_PRIVILEGE_ENABLED;
 
     status = NtAdjustPrivilegesToken(processToken, FALSE, tp, size, NULL, NULL);
 
@@ -881,7 +885,7 @@ static void RecordLine(IN HANDLE file, IN const WCHAR *format, ...)
 
 // Overwritten every run. One `key=value` line per field plus one `entry=` line per
 // configured path, so a health check can grep it.
-static void WriteResultRecord(IN const WCHAR *result, IN const WCHAR *reason, IN NTSTATUS status,
+static void WriteResultRecord(IN const WCHAR *result, IN const WCHAR *reason, IN NTSTATUS status, IN const WCHAR *clockOutcome,
                               IN const BD_LIST *list, IN const BD_ENTRY_RESULT *results, IN const BD_REPORT *report)
 {
     HANDLE file = NULL;
@@ -896,7 +900,7 @@ static void WriteResultRecord(IN const WCHAR *result, IN const WCHAR *reason, IN
         return;
     }
     FileWrite(file, utf16Bom, RTL_NUMBER_OF(utf16Bom), NULL);
-    RecordLine(file, L"result=%s\r\nreason=%s\r\nstatus=0x%08x\r\n", result, reason, status);
+    RecordLine(file, L"result=%s\r\nreason=%s\r\nstatus=0x%08x\r\nclock=%s\r\n", result, reason, status, clockOutcome);
     if (report)
     {
         RecordLine(file, L"entries=%lu\r\nok=%lu\r\nfailed=%lu\r\nseeded=%lu\r\nwarnings=%lu\r\n",
@@ -939,6 +943,8 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
     BD_REPORT report;
     const WCHAR *result = L"failed";
     const WCHAR *reason = L"unknown";
+    const WCHAR *clockOutcome;
+    IO_STATUS_BLOCK iosb;
 
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
@@ -1022,13 +1028,17 @@ NTSTATUS wmain(INT argc, WCHAR *argv[], WCHAR *envp[], ULONG DebugFlag OPTIONAL)
 
 cleanup:
     LogTime(L"End time");
-    WriteResultRecord(result, reason, status, list, results, list ? &report : NULL);
+    // After the binding work, so a fault in the correction cannot undo a bind.
+    clockOutcome = BootClockCorrect();
+    WriteResultRecord(result, reason, status, clockOutcome, list, results, list ? &report : NULL);
     if (results)
         RtlFreeHeap(g_Heap, 0, results);
     if (list)
         RtlFreeHeap(g_Heap, 0, list);
     if (g_LogFile)
     {
+        // The log must outlive a wedge later in this boot.
+        NtFlushBuffersFile(g_LogFile, &iosb);
         NtClose(g_LogFile);
         g_LogFile = NULL;
     }

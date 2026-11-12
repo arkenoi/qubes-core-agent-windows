@@ -203,18 +203,6 @@ void WriteResultRecord(IN const WCHAR *result, IN const WCHAR *reason, IN NTSTAT
     NtLog(TRUE, L"[*] Result record written to %s: result=%s reason=%s\n", RESULT_RECORD_PATH, result, reason);
 }
 
-// Not declared by ntifs.h (only the Zw variant is); exported by ntdll, same signature.
-NTSTATUS
-NTAPI
-NtQueryValueKey(
-    IN  HANDLE KeyHandle,
-    IN  PUNICODE_STRING ValueName,
-    IN  KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    OUT PVOID KeyValueInformation OPTIONAL,
-    IN  ULONG Length,
-    OUT PULONG ResultLength
-    );
-
 // TRUE if a BootExecute entry is ours. The installer registers the literal
 // "relocate-dir.exe <src> <dst>" (CoreComponents.wxs); match on the image name, case-insensitive
 // (ASCII fold is enough for that literal), so no other vendor's entry can be mistaken for it.
