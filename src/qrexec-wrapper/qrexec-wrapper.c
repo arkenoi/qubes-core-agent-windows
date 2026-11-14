@@ -52,6 +52,20 @@
 
 static CRITICAL_SECTION g_VchanCs;
 
+// Output pumps that are inside a send right now, and the sends they have completed. The drain that
+// follows the child's exit reads both to tell a pump that is delivering output, or waiting for the
+// peer to take it, from one that is idle.
+static volatile LONG g_PumpsSending = 0;
+static volatile LONG g_PumpSends = 0;
+
+// Set when a write to the child's stdin fails. The pipe is closed at that point, and from then on the
+// event loop looks at the child's exit before it serves the vchan.
+static BOOL g_StdinWriteFailed = FALSE;
+
+// Set by InitVchan when it returns a vchan server that no data client connected to. No hello was
+// sent on it, and wmain goes straight to the cleanup that closes it.
+static BOOL g_NoDataClient = FALSE;
+
 // CONSOLE-CONTROL SHUTDOWN (2026-09-29). Measured during a Windows 11 reinstall: two live wrappers were ended with
 // STATUS_CONTROL_C_EXIT by the MSI's Restart Manager, five seconds after the installer had stopped QrexecAgent -
 // wrappers outlive the agent (one was held open by a detached child that inherited its pipes). Without a handler,
@@ -1160,12 +1174,24 @@ DWORD HandleRemoteData(
 
     if (header->type != MSG_DATA_STDERR)
     {
-        assert(child->Stdin.WriteEndpoint);
-        LogVerbose("writing %d bytes of inbound data to child", header->len);
-        if (!QioWriteBuffer(child->Stdin.WriteEndpoint, buffer, header->len))
+        if (!child->Stdin.WriteEndpoint)
         {
-            status = win_perror("writing stdin data");
-            goto cleanup;
+            // The child's stdin is closed - by the peer's end-of-file, by a failed write, or because
+            // this call has no local program - so what still arrives for it has nowhere to go.
+            LogDebug("discarding %u bytes of inbound data: the child's stdin is closed", header->len);
+        }
+        else
+        {
+            LogVerbose("writing %d bytes of inbound data to child", header->len);
+            if (!QioWriteBuffer(child->Stdin.WriteEndpoint, buffer, header->len))
+            {
+                // The child has closed its stdin or has exited. That ends its input, not the call:
+                // its output and its exit code still have to reach the peer. Stdin is closed here,
+                // and the event loop goes on to the child's exit.
+                win_perror("writing stdin data");
+                ClosePipe(&child->Stdin);
+                g_StdinWriteFailed = TRUE;
+            }
         }
     }
     else
@@ -1385,7 +1411,16 @@ static DWORD handle_child_output(
 
         if (nread > 0)
         {
-            if (!VchanSendData(child, buffer, nread, pipe_type))
+            // Counted for the drain that follows the child's exit (EventLoop): a pump that is inside
+            // a send, or has completed one since the drain last looked, is not hung.
+            BOOL sent;
+
+            InterlockedIncrement(&g_PumpsSending);
+            sent = VchanSendData(child, buffer, nread, pipe_type);
+            if (sent)
+                InterlockedIncrement(&g_PumpSends);
+            InterlockedDecrement(&g_PumpsSending);
+            if (!sent)
             {
                 // Every failure path inside VchanSendData logs what failed and what it cost (the
                 // closed peer with the byte count, the header send, the wait for space), so this
@@ -1845,7 +1880,9 @@ static void XifHoldReleaseCollapsed(int domain, int port)
 }
 
 // HELLO ORDER. Both roles send MSG_HELLO here, and this function fails if it cannot, so our hello
-// is on the wire before wmain creates the child or its output pumps.
+// is on the wire before wmain creates the child or its output pumps. The one exception is a server
+// that no data client connected to (g_NoDataClient): it is returned without a hello, and wmain
+// creates nothing for it.
 //
 // It used to be the server's job only. The client left its hello to EventLoop, which it reaches
 // AFTER the child and both pumps are running, and the pumps send without consulting the handshake.
@@ -1868,7 +1905,9 @@ static void XifHoldReleaseCollapsed(int domain, int port)
  * @param domain Remote vchan domain.
  * @param port Remote vchan port.
  * @param isServer Determines if we're acting as the vchan server.
- * @return Pointer to the vchan structure or NULL if failed.
+ * @return Pointer to the vchan structure, or NULL if it could not be created or the hello could not
+ *         be sent. A server that no data client connected to is returned open, without a hello,
+ *         with g_NoDataClient set.
  */
 _Ret_maybenull_
 libvchan_t *InitVchan(
@@ -1889,12 +1928,25 @@ libvchan_t *InitVchan(
         }
 
         LogVerbose("server vchan: %p, waiting for data client", vchan);
-        if (libvchan_wait(vchan) < 0)
+        // The wait for the data client is made here, on the vchan's own event, so that a stop ends
+        // it as well. It has no time limit: the client is waited for as long as it takes.
+        HANDLE waits[2] = { libvchan_fd_for_select(vchan), g_StopEvent };
+        DWORD waited = WaitForMultipleObjects(g_StopEvent ? 2 : 1, waits, FALSE, INFINITE);
+        if (waited != WAIT_OBJECT_0)
         {
-            LogError("libvchan_wait(%p) failed", vchan);
-            libvchan_close(vchan);
-            return NULL;
+            if (waited == WAIT_OBJECT_0 + 1)
+                LogInfo("stop requested while waiting for the data client (domain %d, port %d)", domain, port);
+            else
+                LogError("the wait for the data client failed (domain %d, port %d, wait result 0x%lx, error 0x%lx): "
+                    L"the call is abandoned", domain, port, waited, GetLastError());
+            // Returned open, with no hello sent: wmain goes straight to its cleanup, which closes the
+            // vchan where every data vchan is closed and so withdraws the xenstore entry as well.
+            g_NoDataClient = TRUE;
+            return vchan;
         }
+
+        // The client is connected: remove the xenstore entry, as libvchan_wait does on its return.
+        libvchan_cleanup(vchan);
 
         LogVerbose("remote peer (data client) connected");
         if (!VchanSendHello(vchan))
@@ -1980,7 +2032,13 @@ DWORD EventLoop(
     while (run)
     {
         LogVerbose("waiting");
-        signaled = WaitForMultipleObjects(g_StopEvent ? 3 : 2, waitObjects, FALSE, INFINITE) - WAIT_OBJECT_0;
+        // After a failed stdin write the child's exit is looked at first. The vchan's event is the
+        // lower index of the wait below, so a peer that keeps sending input would win every wait and
+        // the exit arm, which delivers the output and the exit code, would not be reached.
+        if (g_StdinWriteFailed && WaitForSingleObject(child->Process, 0) == WAIT_OBJECT_0)
+            signaled = 1;
+        else
+            signaled = WaitForMultipleObjects(g_StopEvent ? 3 : 2, waitObjects, FALSE, INFINITE) - WAIT_OBJECT_0;
 
         status = ERROR_INVALID_FUNCTION;
 
@@ -2099,6 +2157,7 @@ DWORD EventLoop(
             // as it finishes (a signalled handle left in the set would make the wait return at once forever).
             BOOL stdoutDone = FALSE, stderrDone = FALSE, stopped = FALSE;
             ULONGLONG drainEnd = GetTickCount64() + DRAIN_TIMEOUT_MS;
+            LONG sendsSeen = g_PumpSends;
             status = WAIT_OBJECT_0;
             while (!(stdoutDone && stderrDone))
             {
@@ -2111,6 +2170,15 @@ DWORD EventLoop(
                 ULONGLONG now = GetTickCount64();
                 DWORD left = now >= drainEnd ? 0 : (DWORD)(drainEnd - now);
                 DWORD w = WaitForMultipleObjects(n, drain, FALSE, left);
+                if (w == WAIT_TIMEOUT && (g_PumpsSending > 0 || g_PumpSends != sendsSeen))
+                {
+                    // Not a hang: a pump is inside a send, waiting for the peer to take output, or
+                    // has completed one since the deadline was set. The exit code must not overtake
+                    // that output, so the deadline starts again.
+                    sendsSeen = g_PumpSends;
+                    drainEnd = GetTickCount64() + DRAIN_TIMEOUT_MS;
+                    continue;
+                }
                 if (w == WAIT_TIMEOUT || w == WAIT_FAILED)
                 {
                     status = w;
@@ -2297,6 +2365,11 @@ int wmain(int argc, WCHAR *argv[])
         goto cleanup;
     InterlockedExchange(&g_VchanOpen, 1);
 
+    // A vchan server nobody connected to (InitVchan): no hello went out and there is no call to
+    // serve. The cleanup closes the vchan, which also withdraws its xenstore entry.
+    if (g_NoDataClient)
+        goto cleanup;
+
     if (wcscmp(userName, L"(null)") == 0)
         userName = NULL;
     if (wcsncmp(commandLine, L"(null)", 6) == 0)
@@ -2331,8 +2404,17 @@ int wmain(int argc, WCHAR *argv[])
 
             if (!libvchan_is_open(child->Vchan))
             {
+                // A closed vchan is not an empty one: what the peer sent before it closed, its exit
+                // code included, is still in the ring and is read before leaving.
+                while (VchanGetReadBufferSize(child->Vchan) > 0)
+                {
+                    if (HandleDataMessage(child) != ERROR_SUCCESS)
+                        break;
+                }
                 LogDebug("vchan closed");
                 status = (DWORD)-1;
+                if (g_exitCodeReceived)
+                    status = ERROR_SUCCESS;
                 break;
             }
 
@@ -2425,6 +2507,9 @@ cleanup:
                     // and returns NULL if it cannot, so reaching this block at all means it went
                     // out. Exactly one hello, before the child exists, never after data - by
                     // construction rather than by a check someone has to remember.
+                    // A server nobody connected to (g_NoDataClient) also reaches this block, with
+                    // no hello sent: nothing is sent for it, because the server role sends no exit
+                    // code and no failure text is set.
                     // SAY WHY, in words, before the number. A caller gets the exit code truncated to
                     // 8 bits (1326 arrives as 46), so a bare status tells a user nothing at all -
                     // which is exactly how a failed app-menu start became silent.

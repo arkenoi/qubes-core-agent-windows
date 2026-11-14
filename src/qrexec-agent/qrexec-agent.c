@@ -522,13 +522,10 @@ static DWORD register_vchan_connection(HANDLE handle, int domain, int port)
     }
     ReleaseSRWLockExclusive(&g_ConnectionsHandlesLock);
 
-    // EXHAUSTION IS NOW A FAILURE, not a log line. This used to be `// FIXME: error`: the table
-    // was full, the caller was never told, and the wrapper ran UNTRACKED - its handle never
-    // entered the wait set, so release_connection could never run for it and dom0 never got its
-    // MSG_CONNECTION_TERMINATED. Returning the error makes the exec fail visibly on the one call
-    // that cannot be tracked, instead of silently degrading the whole subsystem.
-    // The handle is closed because nothing will ever wait on it; the process keeps running, which
-    // is the same as before - what changes is that we no longer leak the reference as well.
+    // The table is full. The wrapper is already running and serves its call UNTRACKED: its handle
+    // never enters the wait set, so release_connection never runs for it and dom0 gets no
+    // MSG_CONNECTION_TERMINATED for this connection. The error tells the caller, which logs the
+    // call and keeps serving the others. The handle is closed because nothing will ever wait on it.
     LogError("No free slot for child %p (connection to %d:%d) - %d of %d slots in use",
         handle, domain, port, used, MAX_FDS);
     CloseHandle(handle);
@@ -1192,7 +1189,13 @@ DWORD HandleServiceConnect(IN const struct msg_header* header)
 
     status = StartChild(params->connect_domain, params->connect_port, context->UserName, context->CommandLine, TRUE, TRUE, TRUE);
     if (ERROR_SUCCESS != status)
+    {
         win_perror("StartChild");
+        // A wrapper that cannot be started fails this call only. One that is started but
+        // cannot be tracked serves its call untracked. Either way it is logged and the loop
+        // keeps serving; nothing is sent to the daemon for it.
+        status = ERROR_SUCCESS;
+    }
     // (FindServiceRequest already unlinked it: this thread owns it and frees it below)
 
 cleanup:
@@ -1345,7 +1348,13 @@ static DWORD HandleExec(IN const struct msg_header* header, BOOL piped)
         // Start the wrapper that will take care of data vchan, launch the child and redirect child's IO to data vchan if piped==TRUE.
         status = StartChild(exec->connect_domain, exec->connect_port, userName, commandLine, FALSE, piped, interactive);
         if (ERROR_SUCCESS != status)
+        {
             LogError("StartChild(%s) failed", commandLine);
+            // A wrapper that cannot be started fails this call only. One that is started but
+            // cannot be tracked serves its call untracked. Either way it is logged and the loop
+            // keeps serving; nothing is sent to the daemon for it.
+            status = ERROR_SUCCESS;
+        }
     }
     else
     {
@@ -1354,6 +1363,11 @@ static DWORD HandleExec(IN const struct msg_header* header, BOOL piped)
         StartChild(exec->connect_domain, exec->connect_port, userName, L"dummy", FALSE, piped, interactive);
         status = ERROR_SUCCESS;
     }
+
+    // QREXEC_REMOTE_DOMAIN is in this process's environment only for the launch above, which is
+    // how the wrapper inherits it. It is removed again here, so that no later wrapper carries
+    // the source domain of this call.
+    SetEnvironmentVariableW(L"QREXEC_REMOTE_DOMAIN", NULL);
 
     free(commandLine);
     free(userName);
@@ -1434,9 +1448,11 @@ DWORD ProcessAutostarts(void);
 /**
  * @brief Vchan event loop.
  * @param stopEvent When this event is signaled, the function should exit.
+ * @param pipeServerThread The trigger pipe's accept thread, created suspended. It is resumed once
+ *                         the control channel is connected and the hello is sent.
  * @return Error code.
  */
-static DWORD WatchForEvents(HANDLE stopEvent)
+static DWORD WatchForEvents(HANDLE stopEvent, HANDLE pipeServerThread)
 {
     DWORD signaledEvent;
     DWORD status = ERROR_INVALID_FUNCTION;
@@ -1635,6 +1651,22 @@ static DWORD WatchForEvents(HANDLE stopEvent)
                 daemonConnected = TRUE;
                 LeaveCriticalSection(&g_DaemonCriticalSection);
 
+                // The trigger pipe opens here and not earlier: the control channel is connected and
+                // the hello is in its ring, so a request made inside the qube can neither precede
+                // the hello nor find no channel to be forwarded on. Until this point the pipe does
+                // not exist and a caller's connect fails with ERROR_FILE_NOT_FOUND. A resume that
+                // fails leaves it that way: callers keep failing visibly and calls from dom0 are
+                // still served.
+                if (ResumeThread(pipeServerThread) == (DWORD)-1)
+                {
+                    LogError("trigger pipe not opened: ResumeThread failed (error 0x%lx); calls made inside the qube keep failing",
+                        GetLastError());
+                }
+                else
+                {
+                    LogInfo("hello sent to the daemon: the trigger pipe opens for calls made inside the qube");
+                }
+
                 // advertise tools presence to dom0 by writing appropriate entries to qubesdb
                 // it waits for user logon (event-driven, WTSRegisterSessionNotification).
                 // Launched HERE, on daemon connect, and not from a SERVICE_CONTROL_SESSIONCHANGE
@@ -1767,6 +1799,7 @@ DWORD WINAPI PipeClientThread(PVOID param)
     DWORD status = ERROR_OUTOFMEMORY;
     PSERVICE_REQUEST context;
     size_t stringSize;
+    BOOL clientDisconnected = FALSE;
 
     context = malloc(sizeof(SERVICE_REQUEST));
     if (!context)
@@ -1929,7 +1962,7 @@ DWORD WINAPI PipeClientThread(PVOID param)
         context->UserName, context->CommandLine, requestId);
 
     QpsDisconnectClient(ctx->server, ctx->id);
-
+    clientDisconnected = TRUE;
 
     // MSG_TRIGGER_SERVICE4: fixed part + NUL-terminated service name. The source domain stays EMPTY, exactly as
     // upstream's qrexec-client-vm sends it unless a source qube is given.
@@ -1982,6 +2015,11 @@ cleanup:
         free(context);
 
     }
+
+    // The pipe client is released on every path: a request that fails before it is forwarded
+    // does not leave its client object, queues and lock behind.
+    if (!clientDisconnected)
+        QpsDisconnectClient(ctx->server, ctx->id);
 
     free(ctx);
     return status;
@@ -2125,11 +2163,21 @@ DWORD WINAPI ServiceExecutionThread(void* param)
         &pipeServer);
 
     if (ERROR_SUCCESS != status)
+    {
         win_perror2(status, "create pipe server");
+        // Without a pipe server no call made inside the qube can ever be accepted: the service
+        // ends with the error, so that it is restarted, instead of running on without one.
+        LocalFree(acl);
+        LocalFree(sd);
+        return status;
+    }
 
     LogVerbose("pipe server: %p", pipeServer);
 
-    pipeServerThread = CreateThread(NULL, 0, PipeServerThread, pipeServer, 0, NULL);
+    // The accept thread is created suspended, so the trigger pipe does not exist yet: a caller
+    // inside the qube is not accepted before the control channel is connected and the hello is
+    // sent. WatchForEvents resumes the thread at that point.
+    pipeServerThread = CreateThread(NULL, 0, PipeServerThread, pipeServer, CREATE_SUSPENDED, NULL);
     if (!pipeServerThread)
     {
         status = GetLastError();
@@ -2138,7 +2186,7 @@ DWORD WINAPI ServiceExecutionThread(void* param)
 
     LogVerbose("pipe thread: %p, entering loop", pipeServerThread);
 
-    status = WatchForEvents(ctx->StopEvent);
+    status = WatchForEvents(ctx->StopEvent, pipeServerThread);
     if (ERROR_SUCCESS != status)
         LogDebug("WatchForEvents failed");
 
