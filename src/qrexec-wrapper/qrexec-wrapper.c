@@ -2212,17 +2212,22 @@ void Usage(
 // code; only the unmap waits, RING_HOLD_MS from the moment it was due. Every held unmap moves by the
 // same amount, so the calls keep their own spacing and no timer releases two together. Then it takes
 // its turn on a named mutex: held unmaps run one at a time, each after the previous close has
-// returned. At most RING_HOLD_MAX wrappers hold at once - the rest close at once - and a console
-// control event (g_StopEvent) ends both waits, so the close still runs on this thread at shutdown.
+// returned. At most RING_HOLD_MAX wrappers hold at once - the rest close at once. A console control
+// event (g_StopEvent) ends the hold but not the turn: it reaches every wrapper together, so the held
+// closes it releases still run one at a time. At a stop each waits for its turn at most
+// RING_TURN_STOP_MS, which ends a second before WrapperCtrlHandler stops waiting for the close, so the
+// close still runs on this thread - a turn that does not come in time closes without it.
 #define RING_HOLD_MS  60000
 #define RING_HOLD_MAX 16
+#define RING_TURN_STOP_MS (CTRL_CLOSE_WAIT_MS - 1000)
 
 // What RingHoldPastLogon did for one close, for the line logged after it.
 typedef struct _RING_HOLD
 {
     BOOL Due;           // the close fell inside the window
     BOOL Held;          // a hold slot was free and the hold ran
-    BOOL Stopped;       // a stop ended the hold or the wait for the turn
+    BOOL Stopped;       // a stop ended the hold, or came while it waited for the turn
+    BOOL TurnLapsed;    // at a stop the turn did not come within RING_TURN_STOP_MS; closed without it
     HANDLE Turn;        // the turn mutex, owned; released after the close
     ULONGLONG DueMs;    // from the logon to the moment the close was due
     ULONGLONG HeldMs;
@@ -2239,6 +2244,7 @@ static void RingHoldPastLogon(RING_HOLD *hold)
     ULONGLONG start;
     FILETIME ft;
     HANDLE slots;
+    HANDLE turn;
     HANDLE turnWait[2];
     DWORD waited;
 
@@ -2268,23 +2274,33 @@ static void RingHoldPastLogon(RING_HOLD *hold)
         ReleaseSemaphore(slots, 1, NULL);
     }
     CloseHandle(slots);
-    if (!hold->Held || hold->Stopped)
+    if (!hold->Held)
         return;
 
-    // The turn. A mutex that cannot be made leaves only the one-CPU pin (QREXECPIN) to order the closes.
-    turnWait[0] = CreateMutexW(NULL, FALSE, L"Global\\QwtRingTurn");
-    turnWait[1] = g_StopEvent;
-    if (!turnWait[0])
+    // The turn, at a stop too. A mutex that cannot be made leaves only the one-CPU pin (QREXECPIN) to order the closes.
+    turn = CreateMutexW(NULL, FALSE, L"Global\\QwtRingTurn");
+    if (!turn)
         return;
     start = GetTickCount64();
-    waited = WaitForMultipleObjects(2, turnWait, FALSE, INFINITE);
+    waited = WAIT_OBJECT_0 + 1;
+    if (!hold->Stopped)
+    {
+        turnWait[0] = turn;
+        turnWait[1] = g_StopEvent;
+        waited = WaitForMultipleObjects(2, turnWait, FALSE, INFINITE);
+    }
+    if (waited == WAIT_OBJECT_0 + 1)
+    {
+        hold->Stopped = TRUE;
+        waited = WaitForSingleObject(turn, RING_TURN_STOP_MS);
+    }
     hold->TurnMs = GetTickCount64() - start;
-    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED_0)
-        hold->Turn = turnWait[0];
+    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED)
+        hold->Turn = turn;
     else
     {
-        hold->Stopped = (waited == WAIT_OBJECT_0 + 1);
-        CloseHandle(turnWait[0]);
+        hold->TurnLapsed = (waited == WAIT_TIMEOUT);
+        CloseHandle(turn);
     }
 }
 
@@ -2563,9 +2579,9 @@ cleanup:
             }
             // Logged after the close, so a held unmap writes nothing inside the window.
             if (hold.Held)
-                LogInfo("RINGHOLD the ring was unmapped %I64u ms after the console session's logon: held %I64u ms%s, waited %I64u ms for its turn, the close took %I64u ms",
+                LogInfo("RINGHOLD the ring was unmapped %I64u ms after the console session's logon: held %I64u ms%s, waited %I64u ms for its turn%s, the close took %I64u ms",
                         hold.DueMs + hold.HeldMs + hold.TurnMs, hold.HeldMs, hold.Stopped ? L" until a stop ended it" : L"",
-                        hold.TurnMs, closeMs);
+                        hold.TurnMs, hold.TurnLapsed ? L" and closed without it" : L"", closeMs);
             else if (hold.Due)
                 LogInfo("RINGHOLD no hold slot was free - the ring was unmapped %I64u ms after the console session's logon, the close took %I64u ms",
                         hold.DueMs, closeMs);
