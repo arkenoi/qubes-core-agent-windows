@@ -2206,6 +2206,55 @@ void Usage(
     wprintf(L"command_line: local program to execute and connect to data vchan or (null) if local program is not needed\n");
 }
 
+// THE RING STAYS MAPPED THROUGH THE CONSOLE SESSION'S FIRST SECONDS. Unmapping a mapped grant makes
+// this vCPU wait synchronously for QEMU (docs/ADR-boot.md), and the guest freezes when that wait lands
+// in the first seconds after the session logs on, the busiest moment of a boot. A dom0 call that ends
+// inside RING_HOLD_MS of the logon has already delivered its exit code; only the unmap waits, until
+// the window has passed. At most RING_HOLD_MAX wrappers wait at once, so a burst of calls cannot pile
+// up connections in the agent - the rest close at once - and a console control event (g_StopEvent)
+// ends the wait, so the close still runs on this thread at shutdown.
+#define RING_HOLD_MS  45000
+#define RING_HOLD_MAX 16
+
+static void RingHoldPastLogon(void)
+{
+    DWORD session = WTSGetActiveConsoleSessionId();
+    WTSINFOW *info = NULL;
+    DWORD bytes = 0;
+    DWORD waitMs;
+    ULONGLONG logon;
+    ULONGLONG now;
+    FILETIME ft;
+    HANDLE slots;
+
+    if (session == 0xFFFFFFFF || !g_StopEvent)
+        return;
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, WTSSessionInfo, (LPWSTR *)&info, &bytes) || !info)
+        return;
+    logon = (ULONGLONG)info->LogonTime.QuadPart;
+    WTSFreeMemory(info);
+    GetSystemTimeAsFileTime(&ft);
+    now = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    // Nobody logged on yet, the window already over, or a clock now behind the logon: no hold.
+    if (logon == 0 || now < logon || now - logon >= (ULONGLONG)RING_HOLD_MS * 10000)
+        return;
+    waitMs = RING_HOLD_MS - (DWORD)((now - logon) / 10000);
+
+    slots = CreateSemaphoreW(NULL, RING_HOLD_MAX, RING_HOLD_MAX, L"Global\\QwtRingHold");
+    if (!slots)
+        return;
+    if (WaitForSingleObject(slots, 0) == WAIT_OBJECT_0)
+    {
+        LogInfo("RINGHOLD the console session logged on %lu ms ago - the ring stays mapped %lu ms more",
+                RING_HOLD_MS - waitMs, waitMs);
+        WaitForSingleObject(g_StopEvent, waitMs);
+        ReleaseSemaphore(slots, 1, NULL);
+    }
+    else
+        LogInfo("RINGHOLD every hold slot is taken - the ring closes now");
+    CloseHandle(slots);
+}
+
 /**
  * @brief Entry point.
  * @param argc Number of command line arguments.
@@ -2460,6 +2509,9 @@ cleanup:
             else
                 LogInfo("RINGPEER peer disconnected on entry to cleanup");
             InterlockedExchange(&g_VchanClosing, 1);
+            // Dom0's calls only: the guest maps dom0's ring there, and this close unmaps it.
+            if (!child->IsVchanServer)
+                RingHoldPastLogon();
             EnterCriticalSection(&g_VchanCs);
             libvchan_close(child->Vchan);
             child->Vchan = NULL;
