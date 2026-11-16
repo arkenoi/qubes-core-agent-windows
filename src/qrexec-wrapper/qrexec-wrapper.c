@@ -182,6 +182,8 @@ typedef enum {
     EXIT_REASON_CTRL_STOP,       // a console control event asked us to stop
 } EXIT_REASON;
 static EXIT_REASON g_exitReason = EXIT_REASON_UNSET;
+// When StartChild's process began, for the QREXECCHILD run time.
+static ULONGLONG g_ChildStartedAt = 0;
 // Set when the closed-vchan path has already reported a real loss, WITH the byte count, so
 // the exit path does not report the same teardown a second time. See VchanSendMessage.
 static BOOL g_LossReported = FALSE;
@@ -731,6 +733,9 @@ DWORD StartChild(
         }
     }
 
+    // QREXECCHILD start/exit/still-running: a call that never ends or ends at once is otherwise silent.
+    g_ChildStartedAt = GetTickCount64();
+    LogInfo("QREXECCHILD pid %lu started (piped %d)", GetProcessId(child->Process), piped);
     return ERROR_SUCCESS;
 }
 
@@ -2069,7 +2074,8 @@ DWORD EventLoop(
                 exitCode = 0;
             }
 
-            LogDebug("child process exited with code %d", exitCode);
+            LogInfo("QREXECCHILD pid %lu exited with code %lu (0x%lx) after %llu ms", GetProcessId(child->Process),
+                exitCode, exitCode, GetTickCount64() - g_ChildStartedAt);
 
             // Wait for the i/o threads to DRAIN before sending the exit code.
             //
@@ -2486,6 +2492,11 @@ int wmain(int argc, WCHAR *argv[])
 
 cleanup:
     LogVerbose("exiting");
+
+    // A non-piped call leaves its child running by design; a piped one here is the hang case.
+    if (child && child->Process && WaitForSingleObject(child->Process, 0) == WAIT_TIMEOUT)
+        LogInfo("QREXECCHILD pid %lu still running when the wrapper ends, after %llu ms (piped %d, %s)",
+            GetProcessId(child->Process), GetTickCount64() - g_ChildStartedAt, piped, ExitReasonName(g_exitReason));
 
     if (child)
     {

@@ -851,8 +851,6 @@ static DWORD InterceptRPCRequest(IN OUT WCHAR* commandLine, OUT WCHAR** serviceC
         *sourceDomainName = _wcsdup(separator);
         if (*sourceDomainName == NULL)
             goto end;
-
-        LogDebug("source domain: '%s'", *sourceDomainName);
     }
     else
     {
@@ -863,14 +861,13 @@ static DWORD InterceptRPCRequest(IN OUT WCHAR* commandLine, OUT WCHAR** serviceC
     }
 
     const WCHAR* rpcArgument = ExtractRpcArgument(serviceName);
-    if (rpcArgument)
-    {
-        LogDebug("RPC argument: %s", rpcArgument);
-    }
-    else
-    {
+    if (!rpcArgument)
         rpcArgument = L"";
-    }
+    // WHICH SERVICE dom0 ASKED FOR, before the lookup can fail. The wrapper sees only the expanded
+    // command line, so without this a call that hangs or does nothing cannot be named from the
+    // guest's logs - a menu click and a mode switch read the same.
+    LogInfo("QREXECCALL service '%s' argument '%s' from '%s'", serviceName, rpcArgument,
+        *sourceDomainName ? *sourceDomainName : L"(none)");
 
     status = GetRpcFile(serviceFilePath, QREXEC_RPC_DEFINITION_DIR, serviceName);
     if (status != ERROR_SUCCESS)
@@ -1107,6 +1104,9 @@ static DWORD StartChild(int domain, int port, PWSTR userName, PWSTR commandLine,
     status = CreateNormalProcessAsCurrentUser(command, &wrapper);
     if (status == ERROR_SUCCESS)
     {
+        // Joins the QREXECCALL line above to the wrapper's own log, which names only its pid.
+        if (!isServer)
+            LogInfo("QREXECCALL wrapper pid %lu", GetProcessId(wrapper));
         // Propagate: a connection we cannot track is a failed exec, not a silent success.
         status = register_vchan_connection(wrapper, domain, port);
     }
@@ -1312,7 +1312,8 @@ struct exec_params* HandleExecCommon(IN int bufferSize, OUT WCHAR** userName, OU
     }
     else
     {
-        LogDebug("no service");
+        // A plain command carries whatever the caller typed, so its text stays out of the log.
+        LogInfo("QREXECCALL a plain command, not an RPC service (%Iu characters, text not logged)", wcslen(*commandLine));
     }
 
     LogDebug("success: cmd '%s', user '%s'", *commandLine, *userName);

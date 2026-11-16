@@ -69,6 +69,10 @@ $RegistryMapPathMachine = 'HKLM:\Software\Invisible Things Lab\Qubes Tools'
 
 $desktopBaseName = $args[0]
 if (-not $desktopBaseName) { Fail 'no application id given' }
+# One line per phase at INFO: success is otherwise silent, and a launch that hangs leaves no line at
+# all, so a menu entry that "does nothing" could not be told from one that was never called.
+$launchClock = [System.Diagnostics.Stopwatch]::StartNew()
+LogInfo "StartApp '$desktopBaseName' requested, running as '$env:USERNAME'"
 
 # BUILT-IN ENTRIES (see get-appmenus.ps1). A fresh Windows guest has almost nothing in its Start
 # Menu, and in seamless mode there is no taskbar and no desktop either, so without these the qube
@@ -135,7 +139,7 @@ $deadline = (Get-Date).AddSeconds(60)
 while ($true) {
     $who = $null
     try { $who = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
-    if ($who) { break }
+    if ($who) { LogInfo "StartApp '$desktopBaseName': interactive session of '$who' found after $($launchClock.ElapsedMilliseconds) ms"; break }
     if ((Get-Date) -gt $deadline) {
         Fail 'no interactive session after 60s - nothing can be displayed, refusing to hang'
     }
@@ -157,11 +161,13 @@ try {
             # that silently handed out admin would be a hole, and since 4.3.11 the consent dialog
             # is an ordinary window in dom0 (PromptOnSecureDesktop=0), so it can be answered.
             LogDebug "Starting $($b.File) ELEVATED"
-            Start-Process @splat -Verb RunAs -ErrorAction Stop
+            $started = Start-Process @splat -Verb RunAs -PassThru -ErrorAction Stop
         } else {
             LogDebug "Starting $($b.File)"
-            Start-Process @splat -ErrorAction Stop
+            $started = Start-Process @splat -PassThru -ErrorAction Stop
         }
+        # A URI target (ms-settings:) hands off to the shell and returns no process: 'none'.
+        LogInfo "StartApp '$desktopBaseName': started built-in $($b.File), pid $(if ($started) { $started.Id } else { 'none' }), after $($launchClock.ElapsedMilliseconds) ms"
         exit 0
     }
 } catch {
@@ -240,10 +246,12 @@ LogDebug "Starting $target"
 try {
     if ($target -like 'shell:AppsFolder\*') {
         LogDebug "AppsFolder activation: $target"
-        Start-Process -FilePath 'explorer.exe' -ArgumentList $target -ErrorAction Stop
+        $started = Start-Process -FilePath 'explorer.exe' -ArgumentList $target -PassThru -ErrorAction Stop
     } else {
-        Start-Process -FilePath $target -ErrorAction Stop
+        $started = Start-Process -FilePath $target -PassThru -ErrorAction Stop
     }
 }
 catch { Fail "could not start '$target': $($_.Exception.Message)" }
+# For an AppsFolder target the pid is explorer's hand-off, not the app's.
+LogInfo "StartApp '$desktopBaseName': started $target (AppMap, $mapFrom), pid $(if ($started) { $started.Id } else { 'none' }), after $($launchClock.ElapsedMilliseconds) ms"
 exit 0
