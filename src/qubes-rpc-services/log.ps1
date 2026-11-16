@@ -37,7 +37,10 @@ function LogStart {
     # death record the release gate exists to read. The DATE stays in the name because the retention
     # sweep deletes by age: a name with no date would keep its first creation time for ever.
     $logname = "$baseName-$(Get-Date -Format "yyyyMMdd").log"
-    $global:qwtLogPath = Join-Path $logDir $logName
+    # [IO.Path]::Combine, not Join-Path: Join-Path throws DriveNotFound for a LogDir on a drive that does not
+    # exist (Q: on a qube whose private volume is missing), which ends a caller running under ErrorAction
+    # Stop. Combined, the write fails instead and says the line was LOST, as every other loss does.
+    $global:qwtLogPath = [IO.Path]::Combine([string]$logDir, $logName)
     # AN UNREADABLE LogLevel MUST NOT SILENCE ANYTHING, LEAST OF ALL AN ERROR. This read had the
     # same missing -ErrorAction, so a failure left $qwtLogLevel unset - and `1 -le $null` is False
     # on PowerShell, measured. Every level, LogError included, returned without writing a line and
@@ -116,7 +119,7 @@ function Write-QwtLogLine {
             # The writer creates the directory, as log.c does (CreateDirectory before its first line): a script of ours can
             # run before any windows-utils program has made it. A failure here is said by the write below (line LOST).
             if (-not (Test-Path -LiteralPath $dir)) { try { $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop } catch { } }
-            $path = Join-Path $dir ("$Module-" + (Get-Date -Format 'yyyyMMdd') + '.log')
+            $path = [IO.Path]::Combine($dir, ("$Module-" + (Get-Date -Format 'yyyyMMdd') + '.log'))
             $script:QwtLogPathByModule[$Module] = $path
         }
     } else {
