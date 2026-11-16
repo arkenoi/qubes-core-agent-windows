@@ -73,6 +73,10 @@ if (-not $desktopBaseName) { Fail 'no application id given' }
 # all, so a menu entry that "does nothing" could not be told from one that was never called.
 $launchClock = [System.Diagnostics.Stopwatch]::StartNew()
 LogInfo "StartApp '$desktopBaseName' requested, running as '$env:USERNAME'"
+# WHO WE RUN AS decides whether WMI is needed at all. For a named user qrexec-wrapper waits for the
+# interactive logon and starts this script IN that session with its token (StartChild), so the
+# session and the profile are this process's own. Only a SYSTEM child has to look the user up.
+$runsAsSystem = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
 
 # BUILT-IN ENTRIES (see get-appmenus.ps1). A fresh Windows guest has almost nothing in its Start
 # Menu, and in seamless mode there is no taskbar and no desktop either, so without these the qube
@@ -89,6 +93,7 @@ $edge = @(
 # C:\Windows\system32\config\systemprofile - measured, the window opened titled "systemprofile".
 # Resolve the INTERACTIVE user's folder, which is what the Linux entry's `xdg-open .` means.
 function Resolve-HomeFolder {
+    if (-not $runsAsSystem -and $env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE)) { return $env:USERPROFILE }
     try {
         $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
         if ($u) {
@@ -134,9 +139,14 @@ if ($edge) { $builtin['edge'] = @{ File = $edge; Elevated = $false } }
 # WHY 2 - this loop had NO exit. An app can only start into a session that exists, but if no
 # session ever appears (or Get-CimInstance throws), the old `while (!UserName) { sleep 100ms }`
 # span forever: the qrexec call hangs and the menu entry does nothing, with no error anywhere.
-# Bounded, and it says which exit it took.
+# Bounded, and it says which exit it took. Run only for a SYSTEM child: as the logged-on user the
+# session is this process's own, and a WMI call would be one more dependency between a menu click
+# and the app - the one step this service took that qubes.GetAppmenus, on the same launcher, does not.
+if (-not $runsAsSystem) {
+    LogInfo "StartApp '$desktopBaseName': running in the logged-on session as '$env:USERDOMAIN\$env:USERNAME', no lookup needed"
+}
 $deadline = (Get-Date).AddSeconds(60)
-while ($true) {
+while ($runsAsSystem) {
     $who = $null
     try { $who = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
     if ($who) { LogInfo "StartApp '$desktopBaseName': interactive session of '$who' found after $($launchClock.ElapsedMilliseconds) ms"; break }
