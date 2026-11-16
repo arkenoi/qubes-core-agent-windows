@@ -103,12 +103,16 @@ function Log {
 # RETURNS [bool]: $true written, $false lost (the loss is already said on stderr). A caller must
 # consume it ($ok = ... or $null = ...): an unconsumed $true goes to the output stream, which for a
 # qrexec service is the reply dom0 reads.
+# -Echo also writes the message to the console - stderr for E, stdout otherwise - for a qrexec handler
+# whose caller shows the handler's stderr when it exits non-zero (qubes.ResizeDisk).
 function Write-QwtLogLine {
     param(
         [Parameter(Mandatory, Position = 0)][ValidateSet('E', 'W', 'I', 'D', 'V')][string]$Level,
         [Parameter(Mandatory, Position = 1)][AllowEmptyString()][string]$Message,
-        [string]$Module
+        [string]$Module,
+        [switch]$Echo
     )
+    if ($Echo) { if ($Level -eq 'E') { [Console]::Error.WriteLine($Message) } else { [Console]::Out.WriteLine($Message) } }
     if ($Module) {
         # Get-Variable, not a read: the installer runs ensure-autologon.ps1 and quiet-desktop.ps1 IN ITS
         # PROCESS under Set-StrictMode 1.0, where reading the unset cache throws and ends the script.
