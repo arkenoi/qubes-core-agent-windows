@@ -28,9 +28,74 @@
 #include <qubes-io.h>
 #include <utf8-conv.h>
 #include <log.h>
+#include <config.h>
 
 WCHAR *g_expectedUser;
 BOOL g_sessionFound = FALSE;
+BOOL g_mismatchSaid = FALSE;
+
+// The loud half of a user mismatch (owner, 2026-11-17: "it probably should give a loud warning
+// when user does not match"). A log line is not loud: qrexec-wrapper writes the same text on every
+// user service of such a guest, and the reporter's 26H2 logs held 118 of them that nobody saw. So
+// the mismatch goes to dom0 through the product's ONE error route, qwt-notify-error.ps1 in bin
+// (docs/DESIGN-error-notify.md): ACTION, the service.notify-errors gate, one notification per boot
+// for this id, the per-boot cap and the redaction all live there and none of it is copied here.
+// The text is templated - the route refuses values read from the system - so the two account names
+// stay in this program's log line. Started hidden, in bin, and NOT waited for: the wait never
+// depends on it. The route's outcome is logged to wait-for-logon-notify-<date>.log via bin\log.ps1,
+// as the installer's notices log theirs: an ERROR unless it was sent or is this boot's duplicate.
+// No angle-bracket placeholders in the text: dom0's notification server may read them as markup.
+// Jev on this transport (0.67) and on once per boot (0.56) was under the floor - not verdicts; the
+// route was chosen because it already holds every rule a second copy would have to repeat.
+static void NotifyUserMismatch(void)
+{
+    WCHAR binDir[MAX_PATH] = { 0 };
+    WCHAR powershell[MAX_PATH] = { 0 };
+    WCHAR commandLine[] =
+        L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+        L"try { . .\\log.ps1; $QwtNotifyLog = { param($m) $null = Write-QwtLogLine I $m -Module 'wait-for-logon-notify' } } catch { }; "
+        L"$s = 'unavailable:helper-absent'; "
+        L"if (Test-Path -LiteralPath .\\qwt-notify-error.ps1) { try { . .\\qwt-notify-error.ps1; "
+        L"$ev = 'the wait-for-logon log'; try { $ev = Join-Path (Get-QwtLogDir) ('wait-for-logon-' + (Get-Date -Format yyyyMMdd) + '.log') } catch { }; "
+        L"$s = Send-QwtError -Component 'wait-for-logon' -Id 'default-user-mismatch' -Severity ACTION "
+        L"-Header 'App menu entries start nothing in this qube' "
+        L"-Next 'They wait for the account that dom0 names as this qube default_user, and that account is not the one signed in here. Fix it in dom0 with qvm-prefs: set this qube default_user to the name of your Windows account.' "
+        L"-Cause 'Cause: default_user does not name the Windows account signed in to this qube.' "
+        L"-Tech (Format-QwtNotifyTechLine -Subject 'wait-for-logon.exe' -Code 'QWTUSERMISMATCH' -Count 'reported once per boot' -Evidence $ev) "
+        L"} catch { $s = 'failed: ' + $_.Exception.Message } }; "
+        L"$lv = 'I'; $tail = ''; if ($s -ne 'send' -and $s -ne 'suppressed:duplicate') { $lv = 'E'; $tail = ' - dom0 was NOT notified of the user mismatch; the wait-for-logon log carries it' }; "
+        L"try { $null = Write-QwtLogLine $lv ('dom0 notification wait-for-logon.default-user-mismatch: ' + $s + $tail) -Module 'wait-for-logon-notify' } catch { }\"";
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    DWORD status;
+
+    status = CfgReadString(NULL, L"InstallDir", binDir, RTL_NUMBER_OF(binDir), NULL);
+    if (status != ERROR_SUCCESS)
+    {
+        win_perror2(status, "CfgReadString(InstallDir) - dom0 is NOT notified of the user mismatch");
+        return;
+    }
+    if (!PathAppendW(binDir, L"bin"))
+    {
+        LogError("the tools bin directory does not fit a path - dom0 is NOT notified of the user mismatch");
+        return;
+    }
+    if (!ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                                   powershell, RTL_NUMBER_OF(powershell)))
+    {
+        win_perror("ExpandEnvironmentStrings(powershell) - dom0 is NOT notified of the user mismatch");
+        return;
+    }
+    if (!CreateProcessW(powershell, commandLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, binDir, &si, &pi))
+    {
+        win_perror("CreateProcess(powershell) - dom0 is NOT notified of the user mismatch");
+        return;
+    }
+    LogInfo("user mismatch: the dom0 notification route started (powershell pid %lu, not waited for; "
+            "its outcome goes to wait-for-logon-notify-<date>.log)", pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+}
 
 BOOL CheckSession(DWORD	sessionId)
 {
@@ -45,24 +110,27 @@ BOOL CheckSession(DWORD	sessionId)
 
     LogDebug("Found session: %s", userName);
 
-    // THE SESSION THAT EXISTS IS THE ONE THE CALLER WILL GET, so it ends the wait whatever its
-    // account is called. dom0 sends its `default_user`, which is NOT always this guest's account,
-    // and qrexec-wrapper already runs every user service in the session that exists when the two
-    // differ (its StartChild). This wait demanded the literal name instead, so on such a guest it
-    // never returned: dom0's app menu runs `qvm-run --service`, which calls qubes.WaitForSession
-    // and sends qubes.StartApp only after it returns, so every menu entry started nothing.
-    // MEASURED 2026-11-17 on win11de26-t54 (German 26H2, QWT 4.3.44.1322, account 'user'): name
-    // 'user' on stdin returned 0 in 445 ms, name 'weck' had not returned after 45 s. The field case
-    // (GWeck, post 219): dom0 sent 'user', the guest's only account is 'Weck', and each menu click
-    // left one dom0 call open until logoff. Windows account names are case-insensitive, so the
-    // comparison only decides whether the mismatch is said.
-    if (userName[0] != L'\0')
+    // THE NAME MUST MATCH - the stock rule, restored (owner, 2026-11-17, reverting 5bf6052): this
+    // wait returns only for an active session whose account is EXACTLY the name dom0 sends, its
+    // `default_user`. 5bf6052 let any active session end it, after the GWeck report (post 219) that
+    // dom0's app menu started nothing on a new 26H2 template - dom0 sent 'user', his only account is
+    // 'Weck', and `qvm-run --service` sends qubes.StartApp only after qubes.WaitForSession returns.
+    // He has since said he changed the account himself, so a mismatch is a setting to correct in
+    // dom0 (qvm-prefs <qube> default_user <account>), not a case to absorb here. What changes from
+    // stock is that it is no longer silent: the first mismatched session of this call is said in
+    // the log, naming both accounts, and reported to dom0 (NotifyUserMismatch above).
+    if (wcscmp(userName, g_expectedUser) == 0)
     {
-        if (_wcsicmp(userName, g_expectedUser) != 0)
-            LogWarning("requested user '%s' is not the account logged on interactively ('%s') - "
-                       "that session is the one services run in; dom0's default_user does not match "
-                       "this guest's account", g_expectedUser, userName);
         g_sessionFound = TRUE;
+    }
+    else if (userName[0] != L'\0' && !g_mismatchSaid)
+    {
+        g_mismatchSaid = TRUE;
+        LogWarning("requested user '%s' is not the account logged on interactively ('%s') - this wait "
+                   "returns only when '%s' signs in, so dom0's app menu starts nothing in this qube "
+                   "until its default_user names this guest's account", g_expectedUser, userName,
+                   g_expectedUser);
+        NotifyUserMismatch();
     }
 
     WTSFreeMemory(userName);
