@@ -45,8 +45,23 @@ BOOL CheckSession(DWORD	sessionId)
 
     LogDebug("Found session: %s", userName);
 
-    if (wcscmp(userName, g_expectedUser) == 0)
+    // THE SESSION THAT EXISTS IS THE ONE THE CALLER WILL GET, so it ends the wait whatever its
+    // account is called. dom0 sends its `default_user`, which is NOT always this guest's account,
+    // and qrexec-wrapper already runs every user service in the session that exists when the two
+    // differ (its StartChild). This wait demanded the literal name instead, so on such a guest it
+    // never returned: dom0's app menu runs `qvm-run --service`, which calls qubes.WaitForSession
+    // and sends qubes.StartApp only after it returns, so every menu entry started nothing.
+    // MEASURED 2026-11-17 on win11de26-t54 (German 26H2, QWT 4.3.44.1322, account 'user'): name
+    // 'user' on stdin returned 0 in 445 ms, name 'weck' had not returned after 45 s. The field case
+    // (GWeck, post 219): dom0 sent 'user', the guest's only account is 'Weck', and each menu click
+    // left one dom0 call open until logoff. Windows account names are case-insensitive, so the
+    // comparison only decides whether the mismatch is said.
+    if (userName[0] != L'\0')
     {
+        if (_wcsicmp(userName, g_expectedUser) != 0)
+            LogWarning("requested user '%s' is not the account logged on interactively ('%s') - "
+                       "that session is the one services run in; dom0's default_user does not match "
+                       "this guest's account", g_expectedUser, userName);
         g_sessionFound = TRUE;
     }
 
