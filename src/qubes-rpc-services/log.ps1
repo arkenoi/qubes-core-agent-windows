@@ -144,11 +144,25 @@ function LogAppendLine {
 
 # LogAppendLine's loop, with the path given and the outcome returned. LogAppendLine stays a statement
 # that emits nothing, so no existing caller starts printing True into a qrexec reply.
+# THE FILE IS OPENED THE WAY winutils/src/log.c OPENS IT: shared for read and write, written as UTF-8,
+# a new file starting with log.c's BOM. Add-Content, used here until 2026-11-18, shares neither: measured
+# on Windows PowerShell 5.1.26100 (Win11 26300), a reader opening the file as the log sweep does collided
+# 180706 times while an Add-Content loop wrote, and the WRITER died at line 117 of 3000 because it cannot
+# open a file a reader holds - each such line is LOST here after the 20 attempts below. A FileStream
+# shared ReadWrite in the same probe: 0 collisions, 3001 of 3001 lines. Add-Content also wrote a new file
+# in the ANSI code page (1252: a-umlaut as E4), which every reader of ours decodes as UTF-8.
 function QwtAppendLine {
     param([string]$path, [string]$line)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line + "`r`n")
     for ($attempt = 1; $attempt -le 20; $attempt++) {
         try {
-            Add-Content -LiteralPath $path -Value $line -ErrorAction Stop
+            # The open of Install-QwtImproved.ps1 Write-MirrorLine, write-through included: a line that reached
+            # the file must survive the hang the log volume exists to record.
+            $fs = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::WriteThrough)
+            try {
+                if ($fs.Length -eq 0) { $fs.Write([byte[]](0xEF, 0xBB, 0xBF), 0, 3) }
+                $fs.Write($bytes, 0, $bytes.Length)
+            } finally { $fs.Dispose() }
             return $true
         } catch [System.IO.DirectoryNotFoundException] {
             # An IOException too, but not a collision: the directory is gone. Twenty retries would
