@@ -2212,88 +2212,6 @@ void Usage(
     wprintf(L"command_line: local program to execute and connect to data vchan or (null) if local program is not needed\n");
 }
 
-// A DOM0 CALL'S UNMAP MOVES OUT OF THE CONSOLE SESSION'S FIRST MINUTE (docs/ADR-boot.md §4). Unmapping
-// a mapped grant makes this vCPU wait synchronously for QEMU, which drains all block I/O first. A dom0
-// call whose close falls within RING_HOLD_MS of the console session's logon has already sent its exit
-// code; only the unmap waits, RING_HOLD_MS from the moment it was due. Every held unmap moves by the
-// same amount, so the calls keep their own spacing and no timer releases two together. Then it takes
-// its turn on a named mutex: held unmaps run one at a time, each after the previous close has
-// returned. At most RING_HOLD_MAX wrappers hold at once - the rest close at once - and a console
-// control event (g_StopEvent) ends both waits, so the close still runs on this thread at shutdown.
-#define RING_HOLD_MS  60000
-#define RING_HOLD_MAX 16
-
-// What RingHoldPastLogon did for one close, for the line logged after it.
-typedef struct _RING_HOLD
-{
-    BOOL Due;           // the close fell inside the window
-    BOOL Held;          // a hold slot was free and the hold ran
-    BOOL Stopped;       // a stop ended the hold or the wait for the turn
-    HANDLE Turn;        // the turn mutex, owned; released after the close
-    ULONGLONG DueMs;    // from the logon to the moment the close was due
-    ULONGLONG HeldMs;
-    ULONGLONG TurnMs;
-} RING_HOLD;
-
-static void RingHoldPastLogon(RING_HOLD *hold)
-{
-    DWORD session = WTSGetActiveConsoleSessionId();
-    WTSINFOW *info = NULL;
-    DWORD bytes = 0;
-    ULONGLONG logon;
-    ULONGLONG now;
-    ULONGLONG start;
-    FILETIME ft;
-    HANDLE slots;
-    HANDLE turnWait[2];
-    DWORD waited;
-
-    if (session == 0xFFFFFFFF || !g_StopEvent)
-        return;
-    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, WTSSessionInfo, (LPWSTR *)&info, &bytes) || !info)
-        return;
-    logon = (ULONGLONG)info->LogonTime.QuadPart;
-    WTSFreeMemory(info);
-    GetSystemTimeAsFileTime(&ft);
-    now = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    // Nobody logged on yet, the window already over, or a clock now behind the logon: no hold.
-    if (logon == 0 || now < logon || now - logon >= (ULONGLONG)RING_HOLD_MS * 10000)
-        return;
-    hold->Due = TRUE;
-    hold->DueMs = (now - logon) / 10000;
-
-    slots = CreateSemaphoreW(NULL, RING_HOLD_MAX, RING_HOLD_MAX, L"Global\\QwtRingHold");
-    if (!slots)
-        return;
-    if (WaitForSingleObject(slots, 0) == WAIT_OBJECT_0)
-    {
-        hold->Held = TRUE;
-        start = GetTickCount64();
-        hold->Stopped = WaitForSingleObject(g_StopEvent, RING_HOLD_MS) == WAIT_OBJECT_0;
-        hold->HeldMs = GetTickCount64() - start;
-        ReleaseSemaphore(slots, 1, NULL);
-    }
-    CloseHandle(slots);
-    if (!hold->Held || hold->Stopped)
-        return;
-
-    // The turn. A mutex that cannot be made leaves only the one-CPU pin (QREXECPIN) to order the closes.
-    turnWait[0] = CreateMutexW(NULL, FALSE, L"Global\\QwtRingTurn");
-    turnWait[1] = g_StopEvent;
-    if (!turnWait[0])
-        return;
-    start = GetTickCount64();
-    waited = WaitForMultipleObjects(2, turnWait, FALSE, INFINITE);
-    hold->TurnMs = GetTickCount64() - start;
-    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED_0)
-        hold->Turn = turnWait[0];
-    else
-    {
-        hold->Stopped = (waited == WAIT_OBJECT_0 + 1);
-        CloseHandle(turnWait[0]);
-    }
-}
-
 /**
  * @brief Entry point.
  * @param argc Number of command line arguments.
@@ -2508,11 +2426,7 @@ cleanup:
         {
             // RINGPEER: the peer's own liveness flag on entry to cleanup - findings/wedge.md bullet 12.
             int peerAtCleanup = libvchan_is_open(child->Vchan);
-            RING_HOLD hold;
-            ULONGLONG closeStart;
-            ULONGLONG closeMs;
 
-            ZeroMemory(&hold, sizeof(hold));
             if (peerAtCleanup)
             {
                 // send "exit code" (creation status really) if the io isn't piped or child creation failed
@@ -2557,29 +2471,11 @@ cleanup:
             else
                 LogInfo("RINGPEER peer disconnected on entry to cleanup");
             InterlockedExchange(&g_VchanClosing, 1);
-            // Dom0's calls only: the guest maps dom0's ring there, and this close unmaps it.
-            if (!child->IsVchanServer)
-                RingHoldPastLogon(&hold);
-            closeStart = GetTickCount64();
             EnterCriticalSection(&g_VchanCs);
             libvchan_close(child->Vchan);
             child->Vchan = NULL;
             InterlockedExchange(&g_VchanOpen, 0);
             LeaveCriticalSection(&g_VchanCs);
-            closeMs = GetTickCount64() - closeStart;
-            if (hold.Turn)
-            {
-                ReleaseMutex(hold.Turn);
-                CloseHandle(hold.Turn);
-            }
-            // Logged after the close, so a held unmap writes nothing inside the window.
-            if (hold.Held)
-                LogInfo("RINGHOLD the ring was unmapped %I64u ms after the console session's logon: held %I64u ms%s, waited %I64u ms for its turn, the close took %I64u ms",
-                        hold.DueMs + hold.HeldMs + hold.TurnMs, hold.HeldMs, hold.Stopped ? L" until a stop ended it" : L"",
-                        hold.TurnMs, closeMs);
-            else if (hold.Due)
-                LogInfo("RINGHOLD no hold slot was free - the ring was unmapped %I64u ms after the console session's logon, the close took %I64u ms",
-                        hold.DueMs, closeMs);
         }
 
         // A pump still running here keeps using `child` (its pipe, the pointer above) until it notices, so the state
