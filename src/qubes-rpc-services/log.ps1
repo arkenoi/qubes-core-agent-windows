@@ -134,10 +134,10 @@ function Write-QwtLogLine {
 }
 
 function LogAppendLine {
-    # Concurrent invocations of one script now share one file, so an append can lose the file to
-    # another writer (ERROR_SHARING_VIOLATION, surfaced as IOException). PowerShell has no
-    # atomic-append primitive, so the collision is RETRIED - briefly and a bounded number of times -
-    # and a line that still cannot be written SAYS SO on stderr. A dropped log line is never silent.
+    # Concurrent invocations of one script share one file. QwtAppendLine appends append-only, so
+    # their lines interleave but never overwrite; an open that still fails (an IOException from a
+    # holder that does not share) is RETRIED - briefly and a bounded number of times - and a line
+    # that still cannot be written SAYS SO on stderr. A dropped log line is never silent.
     param([string]$line)
     $null = QwtAppendLine $global:qwtLogPath $line
 }
@@ -154,15 +154,37 @@ function LogAppendLine {
 function QwtAppendLine {
     param([string]$path, [string]$line)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($line + "`r`n")
+    # APPEND-ONLY, AS log.c OPENS IT: AppendData WITHOUT WriteData, so each write lands at the end of the
+    # file whatever another process appended since this one opened it ("write operations will not
+    # overwrite existing data if this flag is specified without FILE_WRITE_DATA", File Access Rights
+    # Constants). FileAccess.Write, used from 9fd3b1f, carries WriteData: .NET seeks to the end ONCE at the
+    # open and writes there, so two processes opening together wrote at ONE offset and the second line
+    # overwrote the first's head - measured on build-4.3.45.1362, win11-reinstall, record-reboot-cause.ps1:
+    # an 86-byte id=41 line over the first 86 bytes of a concurrent id=1074 line, sweep INVALID.
+    # THE BOM BELONGS TO WHOEVER CREATES THE FILE (log.c's CREATE_NEW): a length check lets two first
+    # writers both read zero and both write one. The line goes out in ONE Write, so it is one WriteFile.
+    $rights = [System.Security.AccessControl.FileSystemRights]::AppendData
     for ($attempt = 1; $attempt -le 20; $attempt++) {
         try {
-            # The open of Install-QwtImproved.ps1 Write-MirrorLine, write-through included: a line that reached
-            # the file must survive the hang the log volume exists to record.
-            $fs = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::WriteThrough)
+            # Write-through, as Install-QwtImproved.ps1 Write-MirrorLine: a line that reached the file must
+            # survive the hang the log volume exists to record.
+            $fs = $null
+            $out = $bytes
             try {
-                if ($fs.Length -eq 0) { $fs.Write([byte[]](0xEF, 0xBB, 0xBF), 0, 3) }
-                $fs.Write($bytes, 0, $bytes.Length)
-            } finally { $fs.Dispose() }
+                # ::new, not New-Object: New-Object hands the catch a MethodInvocationException whose
+                # HResult is 0x80131501, so the file-exists test below never saw 80 and every writer but
+                # the creator lost its line (measured on Windows PowerShell 5.1, win11r-shr, 2026-11-18).
+                $fs = [System.IO.FileStream]::new($path, [System.IO.FileMode]::CreateNew, $rights, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::WriteThrough)
+                $out = [byte[]](0xEF, 0xBB, 0xBF) + $bytes
+            } catch [System.IO.IOException] {
+                # ERROR_FILE_EXISTS (80): another writer created it and owns the BOM. Anything else -
+                # a collision, a missing directory - goes to the handlers below.
+                if (($_.Exception.HResult -band 0xFFFF) -ne 80) { throw }
+            }
+            if ($null -eq $fs) {
+                $fs = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Append, $rights, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::WriteThrough)
+            }
+            try { $fs.Write($out, 0, $out.Length) } finally { $fs.Dispose() }
             return $true
         } catch [System.IO.DirectoryNotFoundException] {
             # An IOException too, but not a collision: the directory is gone. Twenty retries would
